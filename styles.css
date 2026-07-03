@@ -1,0 +1,9 @@
+body.drivesync-hide-id .metadata-property[data-property-key="drivesync_id"] {
+   display: none !important; 
+}
+
+body.drivesync-hide-all-properties .metadata-container {
+    display: none !important;
+}
+
+.drivesync-create-new { color: var(--text-accent); font-style: italic; }

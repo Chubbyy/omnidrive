@@ -1,0 +1,10 @@
+{
+    "id": "drivesync",
+    "name": "DriveSync BYOK",
+    "version": "1.0.0",
+    "minAppVersion": "0.15.0",
+    "description": "A privacy-first Google Drive BYOK synchronization engine for Obsidian.",
+    "author": "Yom Patel",
+    "authorUrl": "https://github.com/Chubbyy",
+    "isDesktopOnly": false
+}
