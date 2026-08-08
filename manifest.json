@@ -1,9 +1,9 @@
 {
-    "id": "drivesync",
-    "name": "DriveSync BYOK",
+    "id": "omnidrive",
+    "name": "OmniDrive",
     "version": "1.0.0",
     "minAppVersion": "0.15.0",
-    "description": "A privacy-first Google Drive BYOK synchronization engine for Obsidian.",
+    "description": "Synchronize your vault with Google Drive using a privacy-first BYOK architecture.",
     "author": "Yom Patel",
     "authorUrl": "https://github.com/Chubbyy",
     "isDesktopOnly": false

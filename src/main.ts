@@ -1,28 +1,39 @@
-import {App, Notice, Plugin, request, requestUrl, TFile, TFolder} from 'obsidian';
-import {DEFAULT_SETTINGS, MyPluginSettings, SampleSettingTab} from "./settings";
+import {App, Notice, Plugin, request, requestUrl, TFile, TFolder, Platform, TAbstractFile} from 'obsidian';
+import {DEFAULT_SETTINGS, OmniDriveSettings, OmniDriveSettingTab} from "./settings";
 
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+export default class OmniDrive extends Plugin {
+	settings!: OmniDriveSettings;
 	lastSyncTime: number = 0;
-	autoSyncInteralRef: number | null = null;
+	autoSyncIntervalRef: number | null = null;
 	isSyncing: boolean = false;
 
 	syncQueue: (() => Promise<void>)[] = [];
 	isProcessingQueue: boolean = false;
+	processingPromise: Promise<void> | null = null;
+	driveFolderResolutionPromise: Promise<string | null> | null = null;
 
 	cachedAccessToken: string | null = null;
 	tokenExpiration: number = 0;
 
+	oauthServer: any = null;
+	oauthState: string | null = null;
+
 	async onload() {
 		await this.loadSettings();
+
+		// Set the default remote vault name to match the local vault name
+		if (this.settings.remoteVaultName === 'Main Vault' || this.settings.remoteVaultName === '') {
+			this.settings.remoteVaultName = this.app.vault.getName();
+			await this.saveSettings();
+		}
 
 		// Apply the CSS toggle based on saved settings when the app starts
 		this.toggleIDVisibility();
 
 		// This creates an icon in the left ribbon.
-		this.addRibbonIcon('cloud', 'DriveSync: Manual Sync', async (evt: MouseEvent) => {
+		this.addRibbonIcon('cloud', 'OmniDrive: Manual sync', async (evt: MouseEvent) => {
 			if (this.isProcessingQueue || this.isSyncing) {
-				new Notice('DriveSync: Sync already in progress.');
+				new Notice('OmniDrive: Sync already in progress.');
 				return;
 			}
 			await this.syncVault();
@@ -31,39 +42,37 @@ export default class MyPlugin extends Plugin {
 		this.app.workspace.onLayoutReady(() => {
 			// Trigger 'catch-up' sync 3 seconds after Obsidian opens
 			setTimeout(() => {
-				this.syncVault();
+				this.syncVault(true);
 			}, 3000);
-		});
 
-		this.registerDomEvent(document, 'visibilitychange', () => {
-			if (document.visibilityState === 'visible') {
-				const now = Date.now();
-
-				if (now - this.lastSyncTime > 60000) {
-					this.log('DriveSync: App brought to foreground. Triggerinng catch-up sync...');
-					this.syncVault();
+			this.registerDomEvent(document, 'visibilitychange', () => {
+				if (document.visibilityState === 'visible') {
+					const now = Date.now();
+					if (now - this.lastSyncTime > 60000) {
+						this.log('OmniDrive: App brought to foreground. Triggering catch-up sync...');
+						this.syncVault(true);
+					}
 				}
-			}
-		})
+			});
+		});
 
 		this.registerEvent(
 			this.app.vault.on('create', async (file) => {
+				if (!this.settings.enableSync || !this.app.workspace.layoutReady) return;
 				this.enqueueTask(async () => {
 					if (this.isPathIgnored(file.path)) return;
 					if (file instanceof TFolder) {
 						if (file.path === '/') return;
-
 						if (this.settings.folderMap[file.path]) return;
 
-						this.log(`DriveSync: Folder created locally. Uploading to Drive...`);
-						
+						this.log(`OmniDrive: Folder created locally. Uploading to Drive...`);
 						const rootFolderID = this.settings.driveFolderID || await this.getCreateDriveFolder();
 						const token = await this.getAccessToken();
 
 						if (rootFolderID && token) {
 							const dummyPath = `${file.path}/dummy.txt`;
 							await this.getTargetFolderID(dummyPath, rootFolderID, token);
-							this.log(`DriveSync: Successfully uploaded folder ${file.name}`);
+							this.log(`OmniDrive: Successfully uploaded folder ${file.name}`);
 						}
 					}
 				});
@@ -72,31 +81,30 @@ export default class MyPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on('rename', async (file, oldPath) => {
+				if (!this.settings.enableSync) return;
 				this.enqueueTask(async () => {
 					if (this.isPathIgnored(file.path)) {
 						const isHistoric = this.settings.syncStrategy === 'historic';
-						let driveIDToKill = this.settings.attachmentMap[oldPath] || this.settings.folderMap[oldPath];
-						let drivesyncIDToKill = this.settings.mdFileMap[oldPath];
+						const driveIDToKill = this.settings.attachmentMap[oldPath] || this.settings.folderMap[oldPath];
+						const omnidriveIDToKill = this.settings.mdFileMap[oldPath];
 
-						if (driveIDToKill || drivesyncIDToKill) {
-							this.log(`DriveSync: Item moved to ignored folder (${file.path}). Queuing for cloud deletion...`);
-
+						if (driveIDToKill || omnidriveIDToKill) {
+							this.log(`OmniDrive: Item moved to ignored folder (${file.path}). Queuing for cloud deletion...`);
 							if (!isHistoric && driveIDToKill) this.settings.tombstones.push(driveIDToKill);
-							if (!isHistoric && drivesyncIDToKill) this.settings.tombstones.push(drivesyncIDToKill);
-
+							if (!isHistoric && omnidriveIDToKill) this.settings.tombstones.push(omnidriveIDToKill);
 							delete this.settings.folderMap[oldPath];
 							delete this.settings.attachmentMap[oldPath];
 							delete this.settings.mdFileMap[oldPath];
 							delete this.settings.mdDriveMap[oldPath];
 							await this.saveSettings();
+							return;
 						}
-						return;
 					}
 
-					this.log(`DriveSync: Rename event detected. Old path: ${oldPath}, New name: ${file.name}`);
+					this.log(`OmniDrive: Rename event detected. Old path: ${oldPath}, New name: ${file.name}`);
 
 					if (file instanceof TFolder) {
-						this.log(`DriveSync: Folder rename detected. Cascading path updates for children...`);
+						this.log(`OmniDrive: Folder rename detected. Cascading path updates for children...`);
 						let mapsUpdated = false;
 
 						const driveFolderID = this.settings.folderMap[oldPath];
@@ -104,108 +112,87 @@ export default class MyPlugin extends Plugin {
 							const token = await this.getAccessToken();
 							if (token) {
 								try {
-									await requestUrl({
-										url: `https://www.googleapis.com/drive/v3/files/${driveFolderID}`,
-										method: 'PATCH',
-										headers: {
-											'Authorization': `Bearer ${token}`,
-											'Content-Type': 'application/json',
-										},
-										body: JSON.stringify({ name: file.name }),
-									});
-									this.log(`DriveSync: Renamed folder in Drive to ${file.name}`);
+									await this.moveOrRenameInDrive(driveFolderID, file, oldPath, token);
+									this.log(`OmniDrive: Renamed/moved folder in Drive to ${file.name}`);
 								} catch (error) {
-									console.error("Failed to rename folder in folder in Drive:", error);
+									console.error("Failed to rename/move folder in Drive:", error);
 								}
 							}
 						}
 
-						const updatePaths = (map: Record<string, string>) => {
-							for (const key of Object.keys(map)) {
-								if (key === oldPath || key.startsWith(oldPath + '/')) {
-									const newKey = file.path + key.substring(oldPath.length);
-									map[newKey] = map[key] as string;
-									delete map[key];
-									mapsUpdated = true;
+							const updatePaths = (map: Record<string, string>) => {
+								for (const key of Object.keys(map)) {
+									if (key === oldPath || key.startsWith(oldPath + '/')) {
+										const newKey = file.path + key.substring(oldPath.length);
+										map[newKey] = map[key] as string;
+										delete map[key];
+										mapsUpdated = true;
+									}
 								}
+							};
+
+							updatePaths(this.settings.attachmentMap);
+							updatePaths(this.settings.mdFileMap);
+							updatePaths(this.settings.mdDriveMap);
+							updatePaths(this.settings.syncState);
+							updatePaths(this.settings.folderMap);
+
+							if (mapsUpdated) {
+								await this.saveSettings();
+								this.log(`OmniDrive: Cascade completed.`);
 							}
-						};
-
-						updatePaths(this.settings.attachmentMap);
-						updatePaths(this.settings.mdFileMap);
-						updatePaths(this.settings.mdDriveMap);
-						updatePaths(this.settings.syncState);
-						updatePaths(this.settings.folderMap);
-
-						if (mapsUpdated) {
-							await this.saveSettings();
-							this.log(`DriveSync: Cascade completed.`)
-						}
 						return;
 					}
 
 					const attachmentDriveID = this.settings.attachmentMap[oldPath];
 					if (attachmentDriveID) {
-						this.log(`DriveSync: Found attachment ID in directory.`);
 						this.settings.attachmentMap[file.path] = attachmentDriveID;
 						delete this.settings.attachmentMap[oldPath];
+						
+						if (this.settings.syncState[oldPath] !== undefined) {
+							this.settings.syncState[file.path] = this.settings.syncState[oldPath];
+							delete this.settings.syncState[oldPath];
+						}
 						await this.saveSettings();
 
 						const token = await this.getAccessToken();
 						if (token) {
 							try {
-								await requestUrl({
-									url: `https://www.googleapis.com/drive/v3/files/${attachmentDriveID}`,
-									method: 'PATCH',
-									headers: { 
-										'Authorization': `Bearer ${token}`, 
-										'Content-Type': 'application/json' 
-									},
-									body: JSON.stringify({ name: file.name })
-								});
-								this.log(`DriveSync: Renamed attachment in Drive to ${file.name}`);
-							} catch (error) { console.error(error); }
+								await this.moveOrRenameInDrive(attachmentDriveID, file, oldPath, token);
+								this.log(`OmniDrive: Renamed/moved attachment in Drive to ${file.name}`);
+							} catch (error) {
+								console.error(error);
+							}
 						}
 						return;
 					}
 
 					if (file instanceof TFile && file.extension === 'md') {
-						this.log(`DriveSync: Processing Markdown rename...`);
-						
-						let driveFileID = this.settings.mdDriveMap[oldPath];
-						let drivesyncID = this.settings.mdFileMap[oldPath];
+						this.log(`OmniDrive: Processing Markdown rename...`);
+						const driveFileID = this.settings.mdDriveMap[oldPath];
+						const omnidriveID = this.settings.mdFileMap[oldPath];
 
 						if (driveFileID) {
 							this.settings.mdDriveMap[file.path] = driveFileID;
 							delete this.settings.mdDriveMap[oldPath];
-						}
-						if (drivesyncID) {
-							this.settings.mdFileMap[file.path] = drivesyncID;
-							delete this.settings.mdFileMap[oldPath];
-						}
-						await this.saveSettings();
 
-						if (!driveFileID) {
-							this.log('DriveSync: File not tracked in memory. Waiting for background sync to heal index.');
-							return;
-						}
+							if (omnidriveID) {
+								this.settings.mdFileMap[file.path] = omnidriveID;
+								delete this.settings.mdFileMap[oldPath];
+							}
+							await this.saveSettings();
 
-						const token = await this.getAccessToken();
-						if (!token) return; 
+							const token = await this.getAccessToken();
+							if (!token) return; 
 
-						try {
-							await requestUrl ({
-								url: `https://www.googleapis.com/drive/v3/files/${driveFileID}`,
-								method: 'PATCH',
-								headers: {
-									'Authorization': `Bearer ${token}`,
-									'Content-Type': 'application/json',
-								},
-								body: JSON.stringify({name: file.name}),
-							});
-							this.log(`DriveSync: Renamed MD file in Drive to ${file.name}`);
-						} catch (error) {
-							console.error("Failed to remove MD file in Drive:", error);
+							try {
+								await this.moveOrRenameInDrive(driveFileID, file, oldPath, token);
+								this.log(`OmniDrive: Renamed/moved MD file in Drive to ${file.name}`);
+							} catch (error) {
+								console.error("Failed to rename/move MD file in Drive:", error);
+							}
+						} else {
+							this.log('OmniDrive: File not tracked in memory. Waiting for background sync to heal index.');
 						}
 					}
 				});
@@ -214,25 +201,48 @@ export default class MyPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on('delete', async (file) => {
+				if (!this.settings.enableSync) return;
 				this.enqueueTask(async () => {
 					if (this.isPathIgnored(file.path)) return;
 					const isHistoric = this.settings.syncStrategy === 'historic';
+					const token = await this.getAccessToken();
 
 					if (file instanceof TFolder) {
 						let mapsUpdated = false;
+						let driveFolderID = this.settings.folderMap[file.path];
 
-						const driveFolderID = this.settings.folderMap[file.path];
+						// Fallback: not tracked locally doesn't mean it doesn't exist in Drive; handling accordingly
+						if (!driveFolderID && token) {
+							const parentPath = file.parent?.path === '/' ? '' : file.parent?.path;
+							const parentID = (parentPath && this.settings.folderMap[parentPath]) || this.settings.driveFolderID;
+
+							if (parentID) {
+								try {
+									const safeName = file.name.replace(/'/g, "\\'");
+									const query = encodeURIComponent(`'${parentID}' in parents and name='${safeName}' and mimeType='application/vnd.google-apps.folder' and trashed=false`);
+									const search = await requestUrl({
+										url: `https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id)`,
+										method: 'GET',
+										headers: {'Authorization': `Bearer ${token}`}
+									});
+									if (search.json.files?.length > 0) driveFolderID = search.json.files[0].id;
+								} catch (e) { console.error("Fallback folder lookup failed:", e); }
+							}
+						}
+
 						if (driveFolderID) {
-							if (!isHistoric) this.settings.tombstones.push(driveFolderID);
+							if (!isHistoric) {
+								await this.deleteFromDriveOrTombstone(driveFolderID, token);
+							}
 							delete this.settings.folderMap[file.path];
 							mapsUpdated = true;
 						}
 
-						const sweepMap = (map: Record<string, string>, addToGraveyard: boolean) => {
+						const sweepMap = async (map: Record<string, string>, addToGraveyard: boolean) => {
 							for (const key of Object.keys(map)) {
 								if (key.startsWith(file.path + '/')) {
 									if (!isHistoric && addToGraveyard) {
-										this.settings.tombstones.push(map[key] as string);
+										await this.deleteFromDriveOrTombstone(map[key] as string, token);
 									}
 									delete map[key];
 									mapsUpdated = true;
@@ -240,47 +250,48 @@ export default class MyPlugin extends Plugin {
 							}
 						};
 
-						sweepMap(this.settings.attachmentMap, true);
-						sweepMap(this.settings.mdFileMap, true);
-						sweepMap(this.settings.mdDriveMap, false); 
-						sweepMap(this.settings.syncState, false);
-						sweepMap(this.settings.folderMap, false);
+						await sweepMap(this.settings.attachmentMap, true);
+						await sweepMap(this.settings.mdFileMap, true);
+						await sweepMap(this.settings.mdDriveMap, false); 
+						await sweepMap(this.settings.syncState, false);
+						await sweepMap(this.settings.folderMap, false);
 
 						if (mapsUpdated) {
 							await this.saveSettings();
-							if (!isHistoric) {
-								this.log(`DriveSync: Cascaded folder deletion to graveyard -> ${file.path}`);
-							}
 						}
 						return;
 					}
 
-					let driveIDToKill = this.settings.attachmentMap[file.path];
-					let drivesyncIDToKill = this.settings.mdFileMap[file.path];
+					const driveIDToKill = this.settings.attachmentMap[file.path];
+					const omnidriveIDToKill = this.settings.mdFileMap[file.path];
 
 					if (driveIDToKill) {
-						if (!isHistoric) this.settings.tombstones.push(driveIDToKill);
+						if (!isHistoric) {
+							await this.deleteFromDriveOrTombstone(driveIDToKill, token);
+						}
 						delete this.settings.attachmentMap[file.path];
 					}
 
-					if (drivesyncIDToKill) {
-						if (!isHistoric) this.settings.tombstones.push(drivesyncIDToKill);
-						delete this.settings.mdFileMap[file.path];
-					}
-
-					if (driveIDToKill || drivesyncIDToKill) {
-						await this.saveSettings();
+					if (omnidriveIDToKill) {
+						const actualDriveID = this.settings.mdDriveMap[file.path];
 						if (!isHistoric) {
-						this.log(`DriveSync: Added [${file.path}] to graveyard.`);
+							if (actualDriveID) {
+								await this.deleteFromDriveOrTombstone(actualDriveID, token);
+							} else {
+								// No known Drive ID for this file; still blacklist by omnidrive_id so it's recognized and cleaned up if it ever resurfaces in a future crawl
+								this.settings.tombstones.push(omnidriveIDToKill);
+							}
 						}
+						delete this.settings.mdFileMap[file.path];
+						delete this.settings.mdDriveMap[file.path];
 					}
 				});
 			})
-		)
+		);
 
 		this.addCommand({
 			id: 'test-google-drive-ping',
-			name: 'Test Google Drive Connection',
+			name: 'Test Google Drive connection',
 			callback: () => {
 				this.testDriveConnection();
 			}
@@ -288,7 +299,7 @@ export default class MyPlugin extends Plugin {
 
 		this.addCommand({
 			id: 'sync-active-file',
-			name: 'Sync Active File',
+			name: 'Sync active file',
 			callback: async () => {
 				const activeFile = this.app.workspace.getActiveFile();
 				if (!activeFile) {
@@ -296,25 +307,25 @@ export default class MyPlugin extends Plugin {
 					return;
 				}
 				if (this.isPathIgnored(activeFile.path)) {
-					new Notice('DriveSync: This file is in an ignored folder.');
+					new Notice('OmniDrive: This file is in an ignored folder.');
 					return;
 				}
 				
 				this.enqueueTask(async () => {
-					new Notice(`DriveSync: Syncing ${activeFile.name}...`);
+					new Notice(`OmniDrive: Syncing ${activeFile.name}...`);
 					if (activeFile.extension === 'md') {
 						await this.syncFile(activeFile);
 					} else if (!activeFile.path.startsWith('.')) {
 						await this.syncAttachment(activeFile);
 					}
-					new Notice(`DriveSync: Finished syncing ${activeFile.name}`);
+					new Notice(`OmniDrive: Finished syncing ${activeFile.name}`);
 				});
 			}
 		});
 
 		this.addCommand({
 			id: 'rebuild-index',
-			name: 'Rebuild Index',
+			name: 'Rebuild index',
 			callback: async () => {
 				await this.rebuildIndex();
 			}
@@ -322,7 +333,7 @@ export default class MyPlugin extends Plugin {
 
 		this.addCommand({
 			id: 'setup-drive-folder',
-			name: 'Setup Google Drive Folder',
+			name: 'Setup Google Drive folder',
 			callback: () => {
 				this.getCreateDriveFolder();
 			}
@@ -330,7 +341,7 @@ export default class MyPlugin extends Plugin {
 
 		this.addCommand({
 			id: 'test-file-hashing',
-			name: 'Calculate Hash of Current File',
+			name: 'Calculate hash of current file',
 			callback: async () => {
 				const activeFile = this.app.workspace.getActiveFile();
 				if (!activeFile) {
@@ -350,7 +361,7 @@ export default class MyPlugin extends Plugin {
 		this.startAutoSync();
 
 		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
+		this.addSettingTab(new OmniDriveSettingTab(this.app, this));
 	}
 
 	log(message: string) {
@@ -362,8 +373,8 @@ export default class MyPlugin extends Plugin {
 	isPathIgnored(path: string): boolean {
 		if (!this.settings.ignoredPaths) return false;
 		
-		// Split the string by commas, remove whitespace, and check if the file path starts with any of them
-		const ignoredList = this.settings.ignoredPaths.split(',').map(p => p.trim()).filter(p => p.length > 0);
+		// Split the string by commas, remove whitespace, strip trailing slashes, and check if the file path starts with any of them
+		const ignoredList = this.settings.ignoredPaths.split(',').map(p => p.trim().replace(/\/+$/, '')).filter(p => p.length > 0);
 		for (const ignored of ignoredList) {
 			if (path.startsWith(ignored)) return true;
 		}
@@ -375,124 +386,230 @@ export default class MyPlugin extends Plugin {
 		this.processQueue();
 	}
 
-	async processQueue() {
-		if (this.isProcessingQueue) return;
-		this.isProcessingQueue = true;
+	async processQueue(): Promise<void> {
+		if (this.processingPromise) return this.processingPromise;
 
-		while (this.syncQueue.length > 0) {
-			const task = this.syncQueue.shift();
-			if (task) {
-				try {
-					await task();
-					// Avoiding Google API 429 rate limiting
-					await new Promise(resolve => setTimeout(resolve, 100));
-				} catch (error: any) {
-					console.error("DriveSync: Queue task failed:", error);
-					
-					// Surface Drive quota errors to the user
-					if (error.message?.includes('403') || error.status === 403 || error.toString().includes('Quota')) {
-						new Notice('DriveSync ERROR: Your Google Drive storage is full!', 10000);
+		this.processingPromise = (async () => {
+			this.isProcessingQueue = true;
+			try {
+				while (this.syncQueue.length > 0) {
+					const task = this.syncQueue.shift();
+					if (task) {
+						try {
+							await task();
+							// Avoiding Google API 429 rate limiting
+							await new Promise(resolve => setTimeout(resolve, 100));
+						} catch (error: any) {
+							console.error("OmniDrive: Queue task failed:", error);
+							// Surface Drive quota errors to the user
+							if (error.message?.includes('403') || error.status === 403 || error.toString().includes('Quota')) {
+								new Notice('OmniDrive ERROR: Your Google Drive storage is full!', 10000);
+							}
+							await new Promise(resolve => setTimeout(resolve, 500));
+						}
 					}
-					
-					await new Promise(resolve => setTimeout(resolve, 500));
 				}
+			} finally {
+				this.isProcessingQueue = false;
+				this.processingPromise = null;
 			}
-		}
-		this.isProcessingQueue = false;
+		})();
+
+		return this.processingPromise;
 	}
 
 	async rebuildIndex() {
-		new Notice('DriveSync: Wiping tracking database and rebuilding index...');
-		this.settings.mdFileMap = {};
-		this.settings.mdDriveMap = {};
-		this.settings.attachmentMap = {};
-		this.settings.folderMap = {};
+		new Notice('OmniDrive: Rebuilding index and pushing local files...');
+		
 		this.settings.syncState = {};
+		this.settings.mdFileMap = {};
+		this.settings.attachmentMap = {};
+		this.settings.mdDriveMap = {};
+		this.settings.folderMap = {};
 		this.settings.tombstones = [];
+		
+		const token = await this.getAccessToken();
+		if (token) {
+			this.settings.driveFolderID = "";
+			await this.getCreateDriveFolder();
+		}
+		
 		await this.saveSettings();
-		await this.syncVault();
+
+		this.isSyncing = true;
+		try {
+			const allFiles = this.app.vault.getFiles();
+			for (const file of allFiles) {
+					if (this.isPathIgnored(file.path)) continue; 
+					this.enqueueTask(async () => {
+						if (file.extension == 'md') {
+							await this.syncFile(file);
+						} else if (!file.path.startsWith('.')) {
+							await this.syncAttachment(file);
+						}
+					});
+				}
+				await this.processQueue();
+			new Notice('OmniDrive: Rebuild complete. Architecture restored.');
+		} catch (error) {
+			console.error(error);
+		} finally {
+			this.isSyncing = false;
+		}
 	}
 
 	startAutoSync() {
-		if (this.autoSyncInteralRef) {
-			window.clearInterval(this.autoSyncInteralRef);
-			this.autoSyncInteralRef = null;
+		if (this.autoSyncIntervalRef) {
+			window.clearInterval(this.autoSyncIntervalRef);
+			this.autoSyncIntervalRef = null;
 		}
 		
 		if (this.settings.autoSyncInterval <= 0) return;
 
 		const intervalMs = this.settings.autoSyncInterval * 60 * 1000;
 
-		this.autoSyncInteralRef = window.setInterval(() => {
-			this.log(`DriveSync: Running scheduled auto-sync (${this.settings.autoSyncInterval} min)...`);
+		this.autoSyncIntervalRef = window.setInterval(() => {
+			this.log(`OmniDrive: Running scheduled auto-sync (${this.settings.autoSyncInterval} min)...`);
 
 			this.syncVault(true);
 		}, intervalMs);
 
-		this.registerInterval(this.autoSyncInteralRef);
+		this.registerInterval(this.autoSyncIntervalRef);
 	}
 
 	onunload() {
 		// Clean up the CSS class if the plugin is turned off
-		document.body.classList.remove('drivesync-hide-id');
-		document.body.classList.remove('drivesync-hide-all-properties')
+		document.body.classList.remove('omnidrive-hide-id');
+		document.body.classList.remove('omnidrive-hide-all-properties')
+
+		if (this.oauthServer) {
+			this.oauthServer.close();
+			this.oauthServer = null;
+		}
 	}
 
 	toggleIDVisibility() {
 		if (this.settings.hideIDProperty) {
-			document.body.classList.add('drivesync-hide-id');
+			document.body.classList.add('omnidrive-hide-id');
 		} else {
-			document.body.classList.remove('drivesync-hide-id');
+			document.body.classList.remove('omnidrive-hide-id');
 		}
 
 		if (this.settings.hideAllProperties) {
-			document.body.classList.add('drivesync-hide-all-properties');
+			document.body.classList.add('omnidrive-hide-all-properties');
 		} else {
-			document.body.classList.remove('drivesync-hide-all-properties')
+			document.body.classList.remove('omnidrive-hide-all-properties')
 		}
 	}
 
 	authenticateGoogle() {
 		if (!this.settings.clientID || !this.settings.clientSecret) {
-			new Notice('Please enter both Client ID and Client Secret first.')
+			new Notice('Please enter both Client ID and Client Secret first.');
 			return;
 		}
 
-		const http = require('http');
-		const server = http.createServer(async (req: any, res: any) => {
-			try {
-				if (!req.url) return;
+		// Generate a secure random state (prevents CSRF: Cross-Site Request Forgery)
+		this.oauthState = window.crypto.randomUUID();
+		
+		const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${this.settings.clientID}&redirect_uri=http://127.0.0.1:8420/callback&response_type=code&access_type=offline&prompt=consent&state=${this.oauthState}&scope=https://www.googleapis.com/auth/drive`;
 
-				const url = new URL(req.url, 'http://127.0.0.1:8420');
+		if (Platform.isDesktopApp) {
+			const http = require('http');
 
-				if (url.pathname === '/callback') {
-					const code = url.searchParams.get('code');
+			if (this.oauthServer) {
+				this.oauthServer.close();
+				this.oauthServer = null;
+			}
 
-					if (code) {
-						await this.exchangeCodeForTokens(code);
+			this.oauthServer = http.createServer(async (req: any, res: any) => {
+				try {
+					if (!req.url) return;
+					const url = new URL(req.url, 'http://127.0.0.1:8420');
+					
+					if (url.pathname === '/callback') {
+						const code = url.searchParams.get('code');
+						const returnedState = url.searchParams.get('state');
 
-						res.writeHead(200, {'Content-Type': 'text/html' });
-						res.end('<h1 style="font-family:sans-serif; text-align:center; margin-top:50px;">Authentication Successful!</h1><p style="font-family:sans-serif; text-align:center;">DriveSync is securely connected. You can close this tab and return to Obsidian.</p>')
-					} else {
-						res.writeHead(400, {'Content-Type': 'text/html'});
-						res.end('<h1 style="font-family:sans-serif; text-align:center; margin-top:50px; color:red;">Authentication Failed</h1><p style="font-family:sans-serif; text-align:center;">No authorization code found.</p>')
+						// Verify the state matches
+						if (returnedState !== this.oauthState) {
+							res.writeHead(400, {'Content-Type': 'text/html'});
+							res.end('<h1 style="font-family:sans-serif; text-align:center; margin-top:50px; color:red;">Authentication Failed</h1><p style="font-family:sans-serif; text-align:center;">Security verification failed (State mismatch).</p>');
+							this.oauthServer.close();
+							this.oauthServer = null;
+							return;
+						}
+
+						if (code) {
+							await this.exchangeCodeForTokens(code);
+							res.writeHead(200, {'Content-Type': 'text/html' });
+							res.end('<h1 style="font-family:sans-serif; text-align:center; margin-top:50px;">Authentication Successful!</h1><p style="font-family:sans-serif; text-align:center;">OmniDrive is securely connected. You can close this tab and return to Obsidian.</p>')
+						} else {
+							res.writeHead(400, {'Content-Type': 'text/html'});
+							res.end('<h1 style="font-family:sans-serif; text-align:center; margin-top:50px; color:red;">Authentication Failed</h1><p style="font-family:sans-serif; text-align:center;">No authorization code found.</p>')
+						}
+						this.oauthServer.close();
+						this.oauthServer = null;
 					}
-
-					server.close();
 				}
-			}
-			catch (e) {
-				console.error(e);
-				res.writeHead(500);
-				res.end('Internal Server Error');
-				server.close()
-			}
-		});
+				catch (e) {
+					console.error(e);
+					res.writeHead(500);
+					res.end('Internal Server Error');
+					if (this.oauthServer) {
+						this.oauthServer.close();
+						this.oauthServer = null;
+					}
+				}
+			});
 
-		server.listen(8420, () => {
-			const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${this.settings.clientID}&redirect_uri=http://127.0.0.1:8420/callback&response_type=code&access_type=offline&prompt=consent&scope=https://www.googleapis.com/auth/drive`;
+			this.oauthServer.on('error', (err: any) => {
+				new Notice(`OmniDrive: Couldn't start local login server. Port 8420 may be in use.`);
+				this.oauthServer = null;
+			});
+
+			this.oauthServer.listen(8420, () => {
+				window.open(authUrl);
+			});
+		} else {
+			new Notice('Opening browser. After authorizing, copy the URL of the error page and paste it into the Manual login setting below.', 10000);
 			window.open(authUrl);
-		});
+		}
+	}
+
+	async processManualAuth(authInput: string) {
+		try {
+			let code = authInput.trim();
+
+			if (code.startsWith('http') || code.includes('code=')) {
+				let returnedState: string | null = null;
+				let extractedCode = '';
+
+				try {
+					const url = new URL(code);
+					extractedCode = url.searchParams.get('code') || '';
+					returnedState = url.searchParams.get('state');
+				} catch {
+					extractedCode = code.match(/code=([^&]+)/)?.[1] || '';
+					returnedState = code.match(/state=([^&]+)/)?.[1] || null;
+				}
+
+				if (returnedState !== this.oauthState) {
+					new Notice('OmniDrive: Security verification failed (state mismatch). Please log in again.');
+					return;
+				}
+				code = extractedCode;
+			}
+
+			if (!code || code.includes('http')) {
+				new Notice('Invalid authorization code format.');
+				return;
+			}
+
+			await this.exchangeCodeForTokens(code);
+		} catch (e) {
+			console.error("Manual Auth Error:", e);
+			new Notice('Failed to process manual auth code.');
+		}
 	}
 
 	async exchangeCodeForTokens(code: string) {
@@ -501,7 +618,7 @@ export default class MyPlugin extends Plugin {
 				url: 'https://oauth2.googleapis.com/token',
 				method: 'POST',
 				headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-				body: `code=${code}&client_id=${this.settings.clientID}&client_secret=${this.settings.clientSecret}&redirect_uri=http://127.0.0.1:8420/callback&grant_type=authorization_code`
+				body: `code=${encodeURIComponent(code)}&client_id=${encodeURIComponent(this.settings.clientID)}&client_secret=${encodeURIComponent(this.settings.clientSecret)}&redirect_uri=http://127.0.0.1:8420/callback&grant_type=authorization_code`
 			});
 
 			const data = response.json;
@@ -509,7 +626,7 @@ export default class MyPlugin extends Plugin {
 			this.settings.refreshToken = data.refresh_token;
 			await this.saveSettings();
 
-			new Notice('DriveSync successfully connected to Google Drive.');
+			new Notice('OmniDrive successfully connected to Google Drive.');
 
 			await this.getCreateDriveFolder();
 		} catch (error) {
@@ -520,36 +637,53 @@ export default class MyPlugin extends Plugin {
 
 	async syncFile(file: TFile) {
 		// Checking local DB first (fast)
-		let drivesyncID = this.settings.mdFileMap[file.path];
+		let omnidriveID = this.settings.mdFileMap[file.path];
 
 		// Parse YAML only if we don't know the file (slow)
-		if (!drivesyncID) {
+		if (!omnidriveID) {
 			await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
-				if (frontmatter['drivesync_id']) {
-					drivesyncID = frontmatter['drivesync_id'];
-
-					const existingPath = Object.keys(this.settings.mdFileMap).find(
-						key => this.settings.mdFileMap[key] === drivesyncID
-					);
-					
-					if (existingPath && existingPath !== file.path) {
-						this.log(`DriveSync: Clone detected (${file.name}). Generating new unique ID...`);
-						drivesyncID = window.crypto.randomUUID();
-						frontmatter['drivesync_id'] = drivesyncID;
-					}
+				if (frontmatter['omnidrive_id']) {
+					omnidriveID = frontmatter['omnidrive_id'];
 				} else {
 					const rememberedID = this.settings.mdFileMap[file.path];
 					if (rememberedID) {
-						this.log(`DriveSync: Restoring accidentally deleted YAML ID for ${file.name}`);
-						drivesyncID = rememberedID;
+						this.log(`OmniDrive: Restoring accidentally deleted YAML ID for ${file.name}`);
+						omnidriveID = rememberedID;
 					} else {
-						drivesyncID = window.crypto.randomUUID();
+						omnidriveID = window.crypto.randomUUID();
+						frontmatter['omnidrive_id'] = omnidriveID;
 					}
-					frontmatter['drivesync_id'] = drivesyncID;
 				}
 			});
 			// Save the newly discovered ID to the map
-			this.settings.mdFileMap[file.path] = drivesyncID as string;
+			if (omnidriveID) this.settings.mdFileMap[file.path] = omnidriveID;
+		}
+
+		const existingPath = Object.keys(this.settings.mdFileMap).find(
+			key => this.settings.mdFileMap[key] === omnidriveID
+		);
+
+		if (existingPath && existingPath !== file.path) {
+			const oldFileStillExists = this.app.vault.getAbstractFileByPath(existingPath) !== null;
+			if (oldFileStillExists) {
+				// Found clone: two real files share the same ID.
+				this.log(`OmniDrive: Clone detected (${file.name}). Generating new unique ID...`);
+				omnidriveID = window.crypto.randomUUID();
+				await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
+					frontmatter['omnidrive_id'] = omnidriveID;
+				});
+				this.settings.mdFileMap[file.path] = omnidriveID;
+			} else {
+				// Old path no longer exists locally; this is a move, not a clone.
+				this.log(`OmniDrive: Detected moved file (${file.name}). Migrating tracking from ${existingPath}.`);
+				const oldDriveID = this.settings.mdDriveMap[existingPath];
+				if (oldDriveID) {
+					this.settings.mdDriveMap[file.path] = oldDriveID;
+					delete this.settings.mdDriveMap[existingPath];
+				}
+				delete this.settings.mdFileMap[existingPath];
+				this.settings.mdFileMap[file.path] = omnidriveID as string;
+			}
 		}
 
 		const folderID = this.settings.driveFolderID || await this.getCreateDriveFolder();
@@ -561,53 +695,89 @@ export default class MyPlugin extends Plugin {
 		try {
 			const localContent = await this.app.vault.read(file);
 			const localHash = await this.calculateHash(localContent);
-			const lastSyncHash = this.settings.syncState[drivesyncID as string];
+			const lastSyncHash = this.settings.syncState[omnidriveID as string];
 
 			let driveFileID = this.settings.mdDriveMap[file.path];
 
 			// Fallback Search (for legacy files)
 			if (!driveFileID) {
-				const searchResponse = await requestUrl({
-					url: `https://www.googleapis.com/drive/v3/files?q=appProperties has { key='drivesync_id' and value='${drivesyncID}' } and trashed=false&fields=files(id)`,
-					method: 'GET',
-					headers: {'Authorization': `Bearer ${token}`},
-				});
-				const files = searchResponse.json.files;
-				if (files && files.length > 0) {
-					driveFileID = files[0].id;
-					this.settings.mdDriveMap[file.path] = driveFileID as string;
+				// Fetch explicitlyTrashed instead and only treat a match as gone if it was trashed directly, not just orphaned by a trashed ancestor
+				const appPropsQuery = encodeURIComponent(`appProperties has { key='omnidrive_id' and value='${omnidriveID}' }`);
+				const searchResponse = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files?q=${appPropsQuery}&fields=files(id,parents,explicitlyTrashed)`, method: 'GET', headers: {'Authorization': `Bearer ${token}`}, throw: false });
+				const recoverableMatch = (searchResponse.status === 200 && searchResponse.json.files)
+					? searchResponse.json.files.find((f: any) => !f.explicitlyTrashed)
+					: null;
+
+				if (recoverableMatch) {
+					driveFileID = recoverableMatch.id;
+
+					// Ensure the file is restored to the correct active folder if its parent was trashed
+					const targetFolderID = await this.getTargetFolderID(file.path, folderID, token);
+					const currentParents = recoverableMatch.parents || [];
+					if (!currentParents.includes(targetFolderID)) {
+						this.log(`OmniDrive: Restoring orphaned file ${file.name} to active Drive folder...`);
+						const parentsToRemove = currentParents.filter((p: string) => p !== targetFolderID).join(',');
+						let patchUrl = `https://www.googleapis.com/drive/v3/files/${driveFileID}?addParents=${targetFolderID}`;
+						if (parentsToRemove) patchUrl += `&removeParents=${parentsToRemove}`;
+						const reattachResponse = await requestUrl({
+							url: patchUrl,
+							method: 'PATCH',
+							headers: {'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json'},
+							body: JSON.stringify({ trashed: false }),
+							throw: false
+						});
+						if (reattachResponse.status < 200 || reattachResponse.status >= 300) {
+							console.error(`OmniDrive: Failed to reattach orphaned file ${file.name} to its active folder (status ${reattachResponse.status}):`, reattachResponse.json || reattachResponse.text);
+						}
+					}
+				} else {
+					// Guard against duplicating a legacy file that already exists in Drive by name
+					const targetFolderID = await this.getTargetFolderID(file.path, folderID, token);
+					const safeName = file.name.replace(/'/g, "\\'");
+					const nameSearch = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(`'${targetFolderID}' in parents and name='${safeName}' and mimeType!='application/vnd.google-apps.folder' and trashed=false`)}&fields=files(id)`, method: 'GET', headers: {'Authorization': `Bearer ${token}`}, throw: false });
+					
+					if (nameSearch.status === 200 && nameSearch.json.files && nameSearch.json.files.length > 0) {
+						driveFileID = nameSearch.json.files[0].id;
+						this.log(`OmniDrive: Found existing MD file by name in Drive, re-linking: ${file.name}`);
+						await requestUrl({ url: `https://www.googleapis.com/drive/v3/files/${driveFileID}`, method: 'PATCH', headers: {'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json'}, body: JSON.stringify({ appProperties: { omnidrive_id: omnidriveID } }), throw: false });
+					}
+				}
+
+				if (driveFileID) {
+					this.settings.mdDriveMap[file.path] = driveFileID;
 					await this.saveSettings();
+				}
+
+				// If it still doesn't have an ID, it is conclusively a new file--upload it
+				if (!driveFileID) {
+					const targetFolderID = await this.getTargetFolderID(file.path, folderID, token);
+					const boundary = 'omnidrive_boundary_' + window.crypto.randomUUID().replace(/-/g, '');
+					const createResponse = await requestUrl({
+						url: 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
+						method: 'POST',
+						headers: {
+							'Authorization': `Bearer ${token}`,
+							'Content-Type': `multipart/related; boundary=${boundary}`
+						},
+						body: `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify({ name: file.name, parents: [targetFolderID], appProperties: {omnidrive_id: omnidriveID} })}\r\n--${boundary}\r\nContent-Type: text/plain\r\n\r\n${localContent}\r\n--${boundary}--`
+					});
+
+					this.settings.mdDriveMap[file.path] = createResponse.json.id;
+					this.settings.syncState[omnidriveID as string] = localHash;
+					await this.saveSettings();
+					return;
 				}
 			}
 
-			// If it still doesn't have an ID, it is conclusively a new file--upload it
-			if (!driveFileID) {
-				const targetFolderID = await this.getTargetFolderID(file.path, folderID, token);
-				const createResponse = await requestUrl({
-					url: 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
-					method: 'POST',
-					headers: {
-						'Authorization': `Bearer ${token}`,
-						'Content-Type': 'multipart/related; boundary=foo_bar_baz',
-					},
-					body: `--foo_bar_baz\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify({
-						name: file.name,
-						parents: [targetFolderID],
-						appProperties: {drivesync_id: drivesyncID}
-					})}\r\n--foo_bar_baz\r\nContent-Type: text/plain\r\n\r\n${localContent}\r\n--foo_bar_baz--`
-				});
-
-				this.settings.mdDriveMap[file.path] = createResponse.json.id;
-				this.settings.syncState[drivesyncID as string] = localHash;
+			const cloudResponse = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files/${driveFileID}?alt=media`, method: 'GET', headers: {'Authorization': `Bearer ${token}`}, throw: false });
+			
+			if (cloudResponse.status >= 400) {
+				this.log(`OmniDrive: Missing/404 on ${file.name}. Healing Markdown index...`);
+				delete this.settings.mdDriveMap[file.path];
 				await this.saveSettings();
+				await this.syncFile(file); // Self-Heal: Re-run as a new file!
 				return;
 			}
-
-			const cloudResponse = await requestUrl({
-				url: `https://www.googleapis.com/drive/v3/files/${driveFileID}?alt=media`,
-				method: 'GET',
-				headers: {'Authorization': `Bearer ${token}`},
-			});
 
 			const cloudContent = cloudResponse.text;
 			const cloudHash = await this.calculateHash(cloudContent);
@@ -615,8 +785,26 @@ export default class MyPlugin extends Plugin {
 			if (localHash === cloudHash) {
 				// same current state between local and cloud
 			} else if (localHash === lastSyncHash && cloudHash !== lastSyncHash) {
-				await this.app.vault.modify(file, cloudContent);
-				this.settings.syncState[drivesyncID as string] = cloudHash;
+				await this.app.vault.process(file, (data) => {
+					return cloudContent;
+				});
+
+				if (!cloudContent.includes('omnidrive_id')) {
+					this.log(`OmniDrive: Cloud copy of ${file.name} was missing its omnidrive_id. Re-injecting and re-pushing...`);
+					await this.app.fileManager.processFrontMatter(file, (fm) => {
+						fm['omnidrive_id'] = omnidriveID;
+					});
+					const healedContent = await this.app.vault.read(file);
+					await requestUrl({
+						url: `https://www.googleapis.com/upload/drive/v3/files/${driveFileID}?uploadType=media`,
+						method: 'PATCH',
+						headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'text/plain' },
+						body: healedContent,
+					});
+					this.settings.syncState[omnidriveID as string] = await this.calculateHash(healedContent);
+				} else {
+					this.settings.syncState[omnidriveID as string] = cloudHash;
+				}
 				await this.saveSettings();
 			} else if (localHash !== lastSyncHash && cloudHash === lastSyncHash) {
 				await requestUrl({
@@ -628,37 +816,33 @@ export default class MyPlugin extends Plugin {
 					},
 					body: localContent,
 				});
-				this.settings.syncState[drivesyncID as string] = localHash;
+				this.settings.syncState[omnidriveID as string] = localHash;
 				await this.saveSettings();
 			} else {
-				new Notice(`Conflict detected in ${file.name}. Creating safe copy...`);
-
+				new Notice(`Conflict detected in ${file.name}. Saving cloud version as backup...`);
 				const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
 				const baseName = file.basename;
 				const extension = file.extension;
-				const conflictFileName = `${baseName} (Conflict ${timestamp}).${extension}`;
-				const conflictFilePath = `${file.parent?.path === '/' ? '': file.parent?.path + '/'}${conflictFileName}`;
-
-				// Rename the local file
-				await this.app.fileManager.renameFile(file, conflictFilePath);
-
-				// Download the cloud file
-				const originalFilepath = `${file.parent?.path === '/' ? '' : file.parent?.path + '/'}${file.name}`;
-				await this.app.vault.create(originalFilepath, cloudContent);
-
-				// The downloaded file keeps the original identity
-				this.settings.mdFileMap[originalFilepath] = drivesyncID as string;
-				this.settings.mdDriveMap[originalFilepath] = driveFileID;
-				this.settings.syncState[drivesyncID as string] = cloudHash;
-
-				// The renamed conflict file loses its tracked identity (uploads as a brand new backup next time)
-				delete this.settings.mdFileMap[conflictFilePath];
-				delete this.settings.mdDriveMap[conflictFilePath];
-
+				const conflictFileName = `${baseName} (Cloud Backup ${timestamp}).${extension}`;
+				const conflictFilePath = `${file.parent?.path === '/' ? '' : file.parent?.path + '/'}${conflictFileName}`;
+				
+				await this.app.vault.create(conflictFilePath, cloudContent);
+				
+				await requestUrl({
+					url: `https://www.googleapis.com/upload/drive/v3/files/${driveFileID}?uploadType=media`,
+					method: 'PATCH',
+					headers: {
+						'Authorization': `Bearer ${token}`,
+						'Content-Type': 'text/plain',
+					},
+					body: localContent,
+				});
+				
+				this.settings.syncState[omnidriveID as string] = localHash;
 				await this.saveSettings();
-				console.warn(`DriveSync: Conflict resolved by duplicating ${file.name}`);
+				console.warn(`OmniDrive: Conflict handled: Kept local version, saved cloud version as ${conflictFileName}`);
 			}
-		} catch (error) {
+		} catch (error: any) {
 			console.error(`Sync Error on ${file.name}:`, error);
 		}
 	}
@@ -734,74 +918,165 @@ async syncAttachment(file: TFile) {
 		if (!token) return;
 
 		try {
-			const currentMTime = file.stat.mtime.toString();
-			const lastMTime = this.settings.syncState[file.path]; 
+			const currentLocalMTime = file.stat.mtime.toString();
+			const state = this.settings.syncState[file.path] || "";
+			const [lastLocalMTime, lastCloudMTime] = state.includes('|') ? state.split('|') : [state, ""];
 
 			let driveFileID = this.settings.attachmentMap[file.path];
 
 			if (!driveFileID) {
-				const binaryContent = await this.app.vault.readBinary(file);
 				const targetFolderID = await this.getTargetFolderID(file.path, folderID, token);
 
-				// If < 5MB, then do the quicker process through the standard API; otherwise, use the 'Resumable Upload' process
-				if (binaryContent.byteLength > 5 * 1024 * 1024) {
-					this.log(`DriveSync: Initiating massive file upload (${file.name})...`);
-					driveFileID = await this.resumableUpload(token, file.name, binaryContent, null, targetFolderID);
+				// Protect against duplicating a file that already exists in Drive
+				const safeName = file.name.replace(/'/g, "\\'");
+				const searchQuery = encodeURIComponent(`'${targetFolderID}' in parents and name='${safeName}' and trashed=false`);
+				const searchResponse = await requestUrl({
+					url: `https://www.googleapis.com/drive/v3/files?q=${searchQuery}&fields=files(id,modifiedTime)`,
+					method: 'GET',
+					headers: {'Authorization': `Bearer ${token}`}
+				});
+				const existing = searchResponse.json.files;
+
+				if (existing && existing.length > 0) {
+					driveFileID = existing[0].id;
+					const cloudMTime = new Date(existing[0].modifiedTime).getTime().toString();
+					this.settings.attachmentMap[file.path] = driveFileID as string;
+					this.settings.syncState[file.path] = `${currentLocalMTime}|${cloudMTime}`;
+					await this.saveSettings();
+					this.log(`OmniDrive: Found existing attachment in Drive, re-linked: ${file.name}`);
 				} else {
-					const createResponse = await requestUrl({
-						url: 'https://www.googleapis.com/drive/v3/files',
-						method: 'POST',
-						headers: {
-							'Authorization': `Bearer ${token}`,
-							'Content-Type': 'application/json',
-						},
-						body: JSON.stringify({
-							name: file.name,
-							parents: [targetFolderID],
-						})
-					});
+					const binaryContent = await this.app.vault.readBinary(file);
 
-					driveFileID = createResponse.json.id;
+					if (binaryContent.byteLength > 5 * 1024 * 1024) {
+						this.log(`OmniDrive: Initiating massive file upload (${file.name})...`);
+						driveFileID = await this.resumableUpload(token, file.name, binaryContent, null, targetFolderID);
+					} else {
+						const createResponse = await requestUrl({
+							url: 'https://www.googleapis.com/drive/v3/files',
+							method: 'POST',
+							headers: {
+								'Authorization': `Bearer ${token}`,
+								'Content-Type': 'application/json',
+							},
+							body: JSON.stringify({
+								name: file.name,
+								parents: [targetFolderID],
+							})
+						});
+						driveFileID = createResponse.json.id;
 
-					await requestUrl({
-						url: `https://www.googleapis.com/upload/drive/v3/files/${driveFileID}?uploadType=media`,
-						method: 'PATCH',
-						headers: {
-							'Authorization': `Bearer ${token}`,
-							'Content-Type': 'application/octet-stream'
-						},
-						body: binaryContent,
-					});
+						await requestUrl({
+							url: `https://www.googleapis.com/upload/drive/v3/files/${driveFileID}?uploadType=media`,
+							method: 'PATCH',
+							headers: {
+								'Authorization': `Bearer ${token}`,
+								'Content-Type': 'application/octet-stream'
+							},
+							body: binaryContent,
+						});
+					}
+
+					const metaRes = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files/${driveFileID}?fields=modifiedTime`, headers: {'Authorization': `Bearer ${token}`} });
+					const currentCloudMTime = new Date(metaRes.json.modifiedTime).getTime().toString();
+
+					this.settings.attachmentMap[file.path] = driveFileID as string;
+					this.settings.syncState[file.path] = `${currentLocalMTime}|${currentCloudMTime}`;
+					await this.saveSettings();
+					this.log(`OmniDrive: Uploaded new attachment: ${file.name}`);
+				}
+			} else {
+					const metaRes = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files/${driveFileID}?fields=modifiedTime`, method: 'GET', headers: {'Authorization': `Bearer ${token}`}, throw: false });
+					
+					if (metaRes.status >= 400) {
+						this.log(`OmniDrive: Missing/404 on attachment ${file.name}. Healing index...`);
+						delete this.settings.attachmentMap[file.path];
+						await this.saveSettings();
+						await this.syncAttachment(file);
+						return;
+					}
+					
+					const currentCloudMTime = new Date(metaRes.json.modifiedTime).getTime().toString();
+
+				// Migrate legacy (pre-3-way) state
+				if (lastCloudMTime === "") {
+					this.settings.syncState[file.path] = `${currentLocalMTime}|${currentCloudMTime}`;
+					await this.saveSettings();
+					this.log(`OmniDrive: Migrated ${file.name} to 3-way attachment tracking.`);
+					return;
 				}
 
-				this.settings.attachmentMap[file.path] = driveFileID as string;
-				this.settings.syncState[file.path] = currentMTime;
-				await this.saveSettings();
-				this.log(`DriveSync: Uploaded new attachment: ${file.name}`);
+				const localChanged = currentLocalMTime !== lastLocalMTime;
+				const cloudChanged = currentCloudMTime !== lastCloudMTime;
 
-			} else if (currentMTime !== lastMTime) {
-				const binaryContent = await this.app.vault.readBinary(file);
-				
-				// Handle large files
-				if (binaryContent.byteLength > 5 * 1024 * 1024) {
-					this.log(`DriveSync: Initiating large file update (${file.name})...`);
-					await this.resumableUpload(token, file.name, binaryContent, driveFileID, null);
-				} else {
-					// Standard API
-					await requestUrl({
-						url: `https://www.googleapis.com/upload/drive/v3/files/${driveFileID}?uploadType=media`,
-						method: 'PATCH',
-						headers: {
-							'Authorization': `Bearer ${token}`,
-							'Content-Type': 'application/octet-stream',
-						},
-						body: binaryContent,
+				if (!localChanged && !cloudChanged) {
+					return; // In sync
+				} else if (!localChanged && cloudChanged) {
+					this.log(`OmniDrive: Cloud attachment changed. Downloading ${file.name}...`);
+					const dl = await requestUrl({
+						url: `https://www.googleapis.com/drive/v3/files/${driveFileID}?alt=media`,
+						method: 'GET',
+						headers: {'Authorization': `Bearer ${token}`}
 					});
+					await this.app.vault.modifyBinary(file, dl.arrayBuffer);
+					const updatedFile = this.app.vault.getAbstractFileByPath(file.path);
+					if (updatedFile instanceof TFile) {
+						this.settings.syncState[file.path] = `${updatedFile.stat.mtime.toString()}|${currentCloudMTime}`;
+						await this.saveSettings();
+					}
+				} else if (localChanged && !cloudChanged) {
+					const binaryContent = await this.app.vault.readBinary(file);
+					if (binaryContent.byteLength > 5 * 1024 * 1024) {
+						this.log(`OmniDrive: Initiating large file update (${file.name})...`);
+						await this.resumableUpload(token, file.name, binaryContent, driveFileID, null);
+					} else {
+						await requestUrl({
+							url: `https://www.googleapis.com/upload/drive/v3/files/${driveFileID}?uploadType=media`,
+							method: 'PATCH',
+							headers: {
+								'Authorization': `Bearer ${token}`,
+								'Content-Type': 'application/octet-stream',
+							},
+							body: binaryContent,
+						});
+					}
+					const metaRes = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files/${driveFileID}?fields=modifiedTime`, headers: {'Authorization': `Bearer ${token}`} });
+					const newCloudMTime = new Date(metaRes.json.modifiedTime).getTime().toString();
+					this.settings.syncState[file.path] = `${currentLocalMTime}|${newCloudMTime}`;
+					await this.saveSettings();
+					this.log(`OmniDrive: Updated attachment: ${file.name}`);
+				} else {
+					new Notice(`Conflict detected in ${file.name}. Saving cloud version as backup...`);
+					const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+					const conflictFileName = `${file.basename} (Cloud Backup ${timestamp}).${file.extension}`;
+					const conflictFilePath = `${file.parent?.path === '/' ? '' : file.parent?.path + '/'}${conflictFileName}`;
+
+					const dl = await requestUrl({
+						url: `https://www.googleapis.com/drive/v3/files/${driveFileID}?alt=media`,
+						method: 'GET',
+						headers: {'Authorization': `Bearer ${token}`}
+					});
+					await this.app.vault.createBinary(conflictFilePath, dl.arrayBuffer);
+
+					const binaryContent = await this.app.vault.readBinary(file);
+					if (binaryContent.byteLength > 5 * 1024 * 1024) {
+						await this.resumableUpload(token, file.name, binaryContent, driveFileID, null);
+					} else {
+						await requestUrl({
+							url: `https://www.googleapis.com/upload/drive/v3/files/${driveFileID}?uploadType=media`,
+							method: 'PATCH',
+							headers: {
+								'Authorization': `Bearer ${token}`,
+								'Content-Type': 'application/octet-stream',
+							},
+							body: binaryContent,
+						});
+					}
+					const metaRes = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files/${driveFileID}?fields=modifiedTime`, headers: {'Authorization': `Bearer ${token}`} });
+					const newCloudMTime = new Date(metaRes.json.modifiedTime).getTime().toString();
+					this.settings.syncState[file.path] = `${currentLocalMTime}|${newCloudMTime}`;
+					await this.saveSettings();
+					console.warn(`OmniDrive: Conflict handled: Kept local version, saved cloud version as ${conflictFileName}`);
 				}
-				
-				this.settings.syncState[file.path] = currentMTime;
-				await this.saveSettings();
-				this.log(`DriveSync: Updated attachment: ${file.name}`);
 			}
 		} catch (error) {
 			console.error(`Attachment Sync Error on ${file.name}:`, error);
@@ -815,73 +1090,99 @@ async syncAttachment(file: TFile) {
 
 		try {
 			const foldersToSearch: {id: string, path: string}[] = [{id: rootFolderID, path: ""}];
-			const cloudFiles: any[] = [];
+			const cloudFiles: {data: any, parentPath: string}[] = [];
+			const foundFolderIDs = new Set<string>();
 
 			while (foldersToSearch.length > 0) {
 				const current = foldersToSearch.shift();
 				if (!current) continue;
-
-				const currentFolderID = current.id;
-				const currentPath = current.path;
-				
 				let pageToken: string | undefined = undefined;
 
 				do {
-					const query = encodeURIComponent(`'${currentFolderID}' in parents and trashed=false`);
-					
-					let url = `https://www.googleapis.com/drive/v3/files?q=${query}&fields=nextPageToken,files(id, name, mimeType, appProperties, parents)`;
-					
-					if (pageToken) {
-						url += `&pageToken=${pageToken}`;
-					}
+					const query = encodeURIComponent(`'${current.id}' in parents and trashed=false`);
+					let url = `https://www.googleapis.com/drive/v3/files?q=${query}&fields=nextPageToken,files(id, name, mimeType, appProperties, parents, modifiedTime)`;
+					if (pageToken) url += `&pageToken=${pageToken}`;
 
-					const search = await requestUrl({
-						url: url,
-						method: 'GET',
-						headers: {'Authorization': `Bearer ${token}`},
-					});
-
+					const search = await requestUrl({ url: url, method: 'GET', headers: {'Authorization': `Bearer ${token}`} });
 					const filesInFolder = search.json.files || [];
-					
 					pageToken = search.json.nextPageToken; 
 
 					for (const file of filesInFolder) {
 						if (file.mimeType === 'application/vnd.google-apps.folder') {
-							const folderLocalPath = currentPath === "" ? file.name : `${currentPath}/${file.name}`;
-							
+							const folderLocalPath = current.path === "" ? file.name : `${current.path}/${file.name}`;
 							if (this.isPathIgnored(folderLocalPath)) continue;
-
 							foldersToSearch.push({id: file.id, path: folderLocalPath});
-							this.settings.folderMap[folderLocalPath] = file.id;
+							
+							const knownFolderPath = Object.keys(this.settings.folderMap).find(p => this.settings.folderMap[p] === file.id);
+							if (knownFolderPath && knownFolderPath !== folderLocalPath) {
+								if (this.settings.syncStrategy === 'two-way') {
+									this.log(`OmniDrive: Remote folder rename detected. Renaming locally...`);
+									const abstractFolder = this.app.vault.getAbstractFileByPath(knownFolderPath);
+									if (abstractFolder) {
+										const parentDir = folderLocalPath.includes('/') ? folderLocalPath.substring(0, folderLocalPath.lastIndexOf('/')) : "";
+										if (parentDir) await this.ensureLocalDirectoryExists(parentDir);
+										try { await this.app.fileManager.renameFile(abstractFolder, folderLocalPath); } catch(e) { console.warn(`OmniDrive: Failed to locally rename folder to ${folderLocalPath}`, e); }
+									}
+									delete this.settings.folderMap[knownFolderPath];
+									this.settings.folderMap[folderLocalPath] = file.id;
+								} else {
+									this.log(`OmniDrive: Drive-side folder rename ignored (${this.settings.syncStrategy} mode): ${knownFolderPath}`);
+								}
+							} else if (!knownFolderPath) {
+								this.settings.folderMap[folderLocalPath] = file.id;
+							}
+							foundFolderIDs.add(file.id);
 						} else {
-							cloudFiles.push(file);
+							cloudFiles.push({data: file, parentPath: current.path});
 						}
 					}
 				} while (pageToken);
 			}
-			await this.saveSettings();
 
-			this.log(`DriveSync RADAR: Crawl complete. Found ${cloudFiles.length} files.`);
+			// A folder that no longer shows up in the crawl is dead; clear its cached ID so future uploads re-search/recreate instead of targeting a parent that's gone
+			const lostFolderPaths: string[] = [];
+			for (const [localPath, driveID] of Object.entries(this.settings.folderMap)) {
+				if (!foundFolderIDs.has(driveID)) {
+					lostFolderPaths.push(localPath);
+					delete this.settings.folderMap[localPath];
+				}
+			}
+
+			await this.saveSettings();
+			this.log(`OmniDrive RADAR: Crawl complete. Found ${cloudFiles.length} files.`);
+
+			const foundCloudIDs = cloudFiles.map(c => c.data.id);
 
 			if (this.settings.syncStrategy === 'two-way') {
-				const foundCloudIDs = cloudFiles.map(file => file.id);
+				const isOrphanedByLostFolder = (path: string) => lostFolderPaths.some(folderPath => path.startsWith(folderPath + '/'));
 
 				const sweepReverseGraveyard = async (map: Record<string, string>, isMarkdown: boolean) => {
 					const pathsToKill: string[] = [];
-
 					for (const [localPath, driveID] of Object.entries(map)) {
 						if (!foundCloudIDs.includes(driveID) && !this.settings.tombstones.includes(driveID)) {
+							if (isOrphanedByLostFolder(localPath)) {
+								this.log(`OmniDrive: ${localPath}'s parent folder vanished from Drive; unlinking (not deleting) so the next pass can re-verify.`);
+								if (isMarkdown) delete this.settings.mdDriveMap[localPath];
+								else delete this.settings.attachmentMap[localPath];
+								continue;
+							}
 							pathsToKill.push(localPath);
 						}
 					}
-					
+					if (pathsToKill.length > 0 && Object.keys(map).length > 0 && pathsToKill.length >= Math.max(3, Object.keys(map).length * 0.8)) {
+						this.log("OmniDrive: Remote deletion detected. Aborting local wipe and forcing re-upload.");
+						for (const path of pathsToKill) {
+							if (isMarkdown) delete this.settings.mdDriveMap[path];
+							else delete this.settings.attachmentMap[path];
+						}
+						return;
+					}
 					for (const path of pathsToKill) {
 						const abstractFile = this.app.vault.getAbstractFileByPath(path);
 						if (abstractFile) {
-							this.log(`DriveSync: Remote deletion detected. Moving local file counterparts to system trash: ${path}`);
-							await this.app.vault.trash(abstractFile, true);
+							this.log(`OmniDrive: Remote deletion detected. Moving local file counterparts to system trash: ${path}`);
+							await this.app.fileManager.trashFile(abstractFile);
 						}
-
 						if (isMarkdown) {
 							const vsID = this.settings.mdFileMap[path];
 							if (vsID) delete this.settings.syncState[vsID];
@@ -895,126 +1196,219 @@ async syncAttachment(file: TFile) {
 				};
 
 				await sweepReverseGraveyard(this.settings.mdDriveMap, true);
-				await sweepReverseGraveyard(this.settings.attachmentMap, true);
+				await sweepReverseGraveyard(this.settings.attachmentMap, false);
+			} else {
+				// Local is the source of truth, so if a tracked file vanished from Drive (deleted or trashed), clear its mapping so it gets pushed again in this sync.
+				const reuploadStale = (map: Record<string, string>) => {
+					const stale = Object.entries(map).filter(([, driveID]) =>
+						!foundCloudIDs.includes(driveID) && !this.settings.tombstones.includes(driveID)
+					);
+					if (stale.length > 0 && Object.keys(map).length > 0 && stale.length >= Math.max(3, Object.keys(map).length * 0.8)) {
+						this.log("OmniDrive: Large portion of tracked files missing from Drive — likely a crawl issue, not real deletions. Skipping mass re-push this cycle.");
+						return;
+					}
+					for (const [localPath] of stale) {
+						delete map[localPath];
+						this.log(`OmniDrive: ${localPath} missing from Drive. Will re-push this sync.`);
+					}
+				};
+				reuploadStale(this.settings.mdDriveMap);
+				reuploadStale(this.settings.attachmentMap);
 			}
 
-			for (const cloudFile of cloudFiles) {
+			for (const cloudItem of cloudFiles) {
+				const cloudFile = cloudItem.data;
 				const driveID = cloudFile.id;
-				const vsID = cloudFile.appProperties?.drivesync_id;
+				const vsID = cloudFile.appProperties?.omnidrive_id;
+				const fullLocalPath = cloudItem.parentPath === "" ? cloudFile.name : `${cloudItem.parentPath}/${cloudFile.name}`;
 
 				if (this.settings.tombstones.includes(driveID) || (vsID && this.settings.tombstones.includes(vsID))) {
-					this.log(`DriveSync: Ghost file detected. Removing ${cloudFile.name} from Drive...`);
-
-					try {
-						await requestUrl({
-							url: `https://www.googleapis.com/drive/v3/files/${driveID}`,
-							method: 'DELETE',
-							headers: {'Authorization': `Bearer ${token}`},
-						});
-					} catch (error) {
-						console.error("Failed to delete ghost file:", error);
+					this.log(`OmniDrive: Ghost file detected. Removing ${cloudFile.name} from Drive...`);
+					const delResponse = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files/${driveID}`, method: 'DELETE', headers: {'Authorization': `Bearer ${token}`}, throw: false });
+					
+					if (delResponse.status >= 400) {
+						console.error(`Failed to delete ghost file ${cloudFile.name} (status ${delResponse.status}):`, delResponse.json || delResponse.text);
+					} else {
+						this.settings.tombstones = this.settings.tombstones.filter(id => id !== driveID && id !== vsID);
 					}
-
-					this.settings.tombstones = this.settings.tombstones.filter(id => id !== driveID && id !== vsID);
+					
 					await this.saveSettings();
 					continue;
 				}
-				if (this.settings.syncStrategy === 'two-way') {
-					if (vsID) {
-						if (!Object.values(this.settings.mdFileMap).includes(vsID)) {
-							this.log(`DriveSync: New .md file detected in Drive. Downloading ${cloudFile.name}...`);
-							try {
-								const dl = await requestUrl({
-									url: `https://www.googleapis.com/drive/v3/files/${driveID}?alt=media`,
-									headers: {'Authorization': `Bearer ${token}`},
-								});
 
-								let localPathPrefix = "";
-								if (cloudFile.parents && cloudFile.parents.length > 0) {
-									localPathPrefix = await this.getLocalPathFromDrive(cloudFile.parents[0], rootFolderID, token);
-								}
-								const fullLocalPath = localPathPrefix + cloudFile.name;
+				const isMarkdown = cloudFile.name.endsWith('.md');
+				let knownPath = null;
+				if (isMarkdown) {
+					knownPath = Object.keys(this.settings.mdDriveMap).find(p => this.settings.mdDriveMap[p] === driveID);
+				} else {
+					knownPath = Object.keys(this.settings.attachmentMap).find(p => this.settings.attachmentMap[p] === driveID);
+				}
 
-								if (this.isPathIgnored(fullLocalPath)) continue;
-
-								await this.app.vault.create(fullLocalPath, dl.text);
-								this.settings.mdFileMap[fullLocalPath] = vsID;
-
+				if (knownPath && knownPath !== fullLocalPath && !this.isPathIgnored(fullLocalPath)) {
+					if (this.settings.syncStrategy === 'two-way') {
+						this.log(`OmniDrive: Remote file rename detected. Renaming locally from ${knownPath} to ${fullLocalPath}...`);
+						const abstractFile = this.app.vault.getAbstractFileByPath(knownPath);
+						if (abstractFile) {
+							if (cloudItem.parentPath) await this.ensureLocalDirectoryExists(cloudItem.parentPath);
+							try { await this.app.fileManager.renameFile(abstractFile, fullLocalPath); } catch(e) { console.warn(`OmniDrive: Failed to locally rename file to ${fullLocalPath}`, e); }
+							
+							if (isMarkdown) {
 								this.settings.mdDriveMap[fullLocalPath] = driveID;
-								
-								this.settings.syncState[vsID] = await this.calculateHash(dl.text); 
-								await this.saveSettings();
-							} catch (e) { console.error(`Failed to download MD file ${cloudFile.name}:`, e); }
+								if (vsID) this.settings.mdFileMap[fullLocalPath] = vsID;
+								delete this.settings.mdDriveMap[knownPath];
+								delete this.settings.mdFileMap[knownPath];
+							} else {
+								this.settings.attachmentMap[fullLocalPath] = driveID;
+								delete this.settings.attachmentMap[knownPath];
+							}
+							if (this.settings.syncState[knownPath]) {
+								this.settings.syncState[fullLocalPath] = this.settings.syncState[knownPath] as string;
+								delete this.settings.syncState[knownPath];
+							}
+							await this.saveSettings();
 						}
 					} else {
-						if (!Object.values(this.settings.attachmentMap).includes(driveID)) {
-							this.log(`DriveSync: New cloud attachment detected. Downloading ${cloudFile.name}...`);
-							try {
-								const dl = await requestUrl({
-									url: `https://www.googleapis.com/drive/v3/files/${driveID}?alt=media`,
-									headers: {'Authorization': `Bearer ${token}`},
-								});
+						this.log(`OmniDrive: Drive-side rename ignored (${this.settings.syncStrategy} mode): ${knownPath}`);
+					}
+				}
 
-								let localPathPrefix = "";
-								if (cloudFile.parents && cloudFile.parents.length > 0) {
-									localPathPrefix = await this.getLocalPathFromDrive(cloudFile.parents[0], rootFolderID, token);
-								}
-								const fullLocalPath = localPathPrefix + cloudFile.name;
+				if (this.settings.syncStrategy === 'two-way') {
+					if (isMarkdown) {
+						const alreadyTracked = Object.values(this.settings.mdDriveMap).includes(driveID);
+						const alreadyLocal = this.app.vault.getAbstractFileByPath(fullLocalPath) !== null;
 
-								if (this.isPathIgnored(fullLocalPath)) continue;
-
-								const newFile = await this.app.vault.createBinary(fullLocalPath, dl.arrayBuffer);
-								this.settings.attachmentMap[fullLocalPath] = driveID;
+						if (!alreadyTracked && !alreadyLocal) {
+							this.log(`OmniDrive: New .md file detected in Drive. Downloading ${cloudFile.name}...`);
+							if (this.isPathIgnored(fullLocalPath)) continue;
+							const dl = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files/${driveID}?alt=media`, headers: {'Authorization': `Bearer ${token}`}, throw: false });
+							if (dl.status === 200) {
+								if (cloudItem.parentPath) await this.ensureLocalDirectoryExists(cloudItem.parentPath);
+								const newFile = await this.app.vault.create(fullLocalPath, dl.text);
 								
-								this.settings.syncState[fullLocalPath] = newFile.stat.mtime.toString();
+								if (vsID) {
+									// Drive object already carries our ID (e.g., a retried patch); rare occurrence. Link immediately
+									this.settings.mdFileMap[fullLocalPath] = vsID;
+									this.settings.mdDriveMap[fullLocalPath] = driveID;
+									this.settings.syncState[vsID] = await this.calculateHash(dl.text);
+									await this.saveSettings();
+								} else {
+									// User manually uploaded this file to Drive, so it lacks an ID. Give it one, push it to Drive (metadata + body), and only record a
+									// syncState baseline if BOTH pushes actually succeeded. If either fails, leave syncState unset; next sync will then see a real
+									// mismatch and route through normal conflict handling (backs up the cloud copy) instead of silently losing the ID
+									const newID = window.crypto.randomUUID();
+									await this.app.fileManager.processFrontMatter(newFile, (fm) => {
+										fm['omnidrive_id'] = newID;
+									});
+
+									const updatedContent = await this.app.vault.read(newFile);
+
+									const metaPatch = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files/${driveID}`, method: 'PATCH', headers: {'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json'}, body: JSON.stringify({ appProperties: { omnidrive_id: newID } }), throw: false });
+									const contentPatch = await requestUrl({ url: `https://www.googleapis.com/upload/drive/v3/files/${driveID}?uploadType=media`, method: 'PATCH', headers: {'Authorization': `Bearer ${token}`, 'Content-Type': 'text/plain'}, body: updatedContent, throw: false });
+
+									this.settings.mdFileMap[fullLocalPath] = newID;
+									this.settings.mdDriveMap[fullLocalPath] = driveID;
+
+									if (metaPatch.status >= 200 && metaPatch.status < 300 && contentPatch.status >= 200 && contentPatch.status < 300) {
+										this.settings.syncState[newID] = await this.calculateHash(updatedContent);
+									} else {
+										console.error(`OmniDrive: Failed to push omnidrive_id back to Drive for ${newFile.name} (meta: ${metaPatch.status}, content: ${contentPatch.status}).`);
+									}
+									await this.saveSettings();
+								}
+							}
+						}
+					} else if (!isMarkdown) {
+						if (!Object.values(this.settings.attachmentMap).includes(driveID)) {
+							this.log(`OmniDrive: New cloud attachment detected. Downloading ${cloudFile.name}...`);
+							if (this.isPathIgnored(fullLocalPath)) continue;
+							const dl = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files/${driveID}?alt=media`, headers: {'Authorization': `Bearer ${token}`}, throw: false });
+							if (dl.status === 200) {
+								if (cloudItem.parentPath) await this.ensureLocalDirectoryExists(cloudItem.parentPath);
+								const newFile = await this.app.vault.createBinary(fullLocalPath, dl.arrayBuffer);
+								const currentCloudMTime = cloudFile.modifiedTime ? new Date(cloudFile.modifiedTime).getTime().toString() : "";
+								this.settings.attachmentMap[fullLocalPath] = driveID;
+								this.settings.syncState[fullLocalPath] = `${newFile.stat.mtime.toString()}|${currentCloudMTime}`;
 								await this.saveSettings();
-							} catch (error) { 
-								console.error(`Failed to download attachment ${cloudFile.name}:`, error); 
 							}
 						}
 					}
 				}
 			}
-			} catch (error) {
+		} catch (error) {
 			console.error("Cloud Pull Error:", error);
-			}
 		}
+	}
 
 	async syncVault(silent: boolean = false) {
+		if (!this.settings.enableSync) {
+			if (!silent) new Notice('OmniDrive: Attempt to Sync canceled; Sync is currently paused in settings.');
+			return;
+		}
+
 		if (this.isSyncing) {
-			this.log('DriveSync: Sync already in progress. Skipping duplicate request.');
+			this.log('OmniDrive: Sync already in progress. Skipping duplicate request.');
 			return;
 		}
 
 		this.isSyncing = true;
-		this.lastSyncTime = Date.now();
 
 		try {
-			if (!silent) new Notice ('DriveSync: Starting background sync...');
+			if (!silent) new Notice('OmniDrive: Starting background sync...');
 
-			await this.pullCloudChanges();
+			const token = await this.getAccessToken();
+			if (!token) {
+				this.isSyncing = false;
+				return;
+			}
+
+			const isValidFolder = await this.verifyRemoteFolder(token);
+			if (!isValidFolder) {
+				this.log('OmniDrive: Remote folder missing. Rebuilding cloud architecture...');
+				this.settings.driveFolderID = ""; 
+				
+				this.settings.syncState = {};
+				this.settings.mdFileMap = {};
+				this.settings.attachmentMap = {};
+				this.settings.mdDriveMap = {};
+				this.settings.folderMap = {};
+				await this.saveSettings();
+				await this.getCreateDriveFolder();
+			}
+
+			// Run the radar scan and let it FULLY finish before snapshotting local files —
+			// otherwise anything it just pulled from Drive won't get pushed back/reconciled
+			// until the next sync cycle.
+			this.enqueueTask(async () => {
+				await this.pullCloudChanges();
+			});
+			await this.processQueue();
 
 			const allFiles = this.app.vault.getFiles();
 
 			for (const file of allFiles) {
-				if (this.isPathIgnored(file.path)) continue; 
-
-				if (file.extension == 'md') {
-					await this.syncFile(file);
-				} else {
-					if (!file.path.startsWith('.')) {
-						this.syncAttachment(file);
+				if (this.isPathIgnored(file.path)) continue;
+				this.enqueueTask(async () => {
+					if (file.extension == 'md') {
+						await this.syncFile(file);
+					} else if (!file.path.startsWith('.')) {
+						await this.syncAttachment(file);
 					}
-				}
+				});
 			}
-			if (!silent) new Notice('DriveSync: Vault syncing successfully completed.');
+			await this.processQueue();
+
+			if (!silent) new Notice('OmniDrive: Vault syncing successfully completed.');
+
+		} catch (error) {
+			console.error("OmniDrive: Sync error", error);
 		} finally {
 			this.isSyncing = false;
+			this.lastSyncTime = Date.now();
 		}
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<MyPluginSettings>);
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<OmniDriveSettings>);
 	}
 
 	async saveSettings() {
@@ -1032,31 +1426,43 @@ async syncAttachment(file: TFile) {
 		}
 
 		try {
-			const response = await requestUrl({
-				url: 'https://oauth2.googleapis.com/token',
-				method: 'POST',
-				headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-				body: `client_id=${this.settings.clientID}&client_secret=${this.settings.clientSecret}&refresh_token=${this.settings.refreshToken}&grant_type=refresh_token`
-			});
+				const response = await requestUrl({
+					url: 'https://oauth2.googleapis.com/token',
+					method: 'POST',
+					headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+					body: `client_id=${encodeURIComponent(this.settings.clientID)}&client_secret=${encodeURIComponent(this.settings.clientSecret)}&refresh_token=${encodeURIComponent(this.settings.refreshToken)}&grant_type=refresh_token`,
+					throw: false
+				});
 
-			this.cachedAccessToken = response.json.access_token;
+				if (response.status !== 200) {
+					if (response.json?.error === 'invalid_grant') {
+						this.log("OmniDrive: Refresh token invalid or expired. Clearing token.");
+						this.settings.refreshToken = '';
+						await this.saveSettings();
+						new Notice('OmniDrive: Your Google login has expired or was revoked. Reconnect via Settings → OmniDrive → Login with Google.', 10000);
+					} else {
+						console.error("Token Refresh Error: ", response.json || response);
+						new Notice('Failed to generate Access Token. Check console.');
+					}
+					return null;
+				}
 
-			// Set expiration to 55 minutes since Google token expires after 60 minutes
-			this.tokenExpiration = Date.now() + (55 * 60 * 1000);
-
-			return this.cachedAccessToken;
-		} catch (error) {
-			console.error("Token Refresh Error: ", error);
-			new Notice('Failed to generate Access Token. Check console.');
-			return null;
-		}
+				this.cachedAccessToken = response.json.access_token;
+				// Set expiration to 55 minutes because Google token expires after 60 minutes
+				this.tokenExpiration = Date.now() + (55 * 60 * 1000);
+				return this.cachedAccessToken;
+			} catch (error) {
+				console.error("Token Refresh Error: ", error);
+				new Notice('Failed to generate Access Token. Check console.');
+				return null;
+			}
 	}
 
 	async scanForRemoteVaults(): Promise<{name: string, id: string, isCreateNew: boolean}[] | null> {
 		const token = await this.getAccessToken();
 		if (!token) return null;
 
-		const masterFolderName = "DriveSync";
+		const masterFolderName = "OmniDrive";
 
 		try {
 			const masterQuery = encodeURIComponent(`mimeType='application/vnd.google-apps.folder' and name='${masterFolderName}' and trashed=false`);
@@ -1074,7 +1480,6 @@ async syncAttachment(file: TFile) {
 			}
 
 			const masterFolderID = masterSearch.json.files[0].id;
-
 			const vaultQuery = encodeURIComponent(`'${masterFolderID}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`);
 			
 			const vaultSearch = await requestUrl({
@@ -1095,10 +1500,20 @@ async syncAttachment(file: TFile) {
 	}
 
 	async getCreateDriveFolder(): Promise<string | null> {
+		if (this.driveFolderResolutionPromise) return this.driveFolderResolutionPromise;
+		this.driveFolderResolutionPromise = this._getCreateDriveFolder();
+		try {
+			return await this.driveFolderResolutionPromise;
+		} finally {
+			this.driveFolderResolutionPromise = null;
+		}
+	}
+
+	private async _getCreateDriveFolder(): Promise<string | null> {
 		const token = await this.getAccessToken();
 		if (!token) return null;
 
-		const masterFolderName = "DriveSync";
+		const masterFolderName = "OmniDrive";
 		const vaultFolderName = this.settings.remoteVaultName || "Main Vault";
 		let masterFolderID = "";
 
@@ -1113,7 +1528,7 @@ async syncAttachment(file: TFile) {
 			if (masterSearch.json.files && masterSearch.json.files.length > 0) {
 				masterFolderID = masterSearch.json.files[0].id;
 			} else {
-				this.log('DriveSync: Creating main DriveSync directory...');
+				this.log('OmniDrive: Creating main OmniDrive directory...');
 				const masterCreate = await requestUrl({
 					url: 'https://www.googleapis.com/drive/v3/files',
 					method: 'POST',
@@ -1123,8 +1538,8 @@ async syncAttachment(file: TFile) {
 				masterFolderID = masterCreate.json.id;
 			}
 
-			const vaultQuery = encodeURIComponent(`'${masterFolderID}' in parents and mimeType='application/vnd.google-apps.folder' and name='${vaultFolderName}' and trashed=false`);
-			const vaultSearch = await requestUrl({
+			const safeVaultName = vaultFolderName.replace(/'/g, "\\'");
+			const vaultQuery = encodeURIComponent(`'${masterFolderID}' in parents and mimeType='application/vnd.google-apps.folder' and name='${safeVaultName}' and trashed=false`);			const vaultSearch = await requestUrl({
 				url: `https://www.googleapis.com/drive/v3/files?q=${vaultQuery}&fields=files(id)`,
 				method: 'GET',
 				headers: {'Authorization': `Bearer ${token}`}
@@ -1134,7 +1549,7 @@ async syncAttachment(file: TFile) {
 			if (vaultSearch.json.files && vaultSearch.json.files.length > 0) {
 				vaultFolderID = vaultSearch.json.files[0].id;
 			} else {
-				this.log(`DriveSync: Creating subfolder for vault: ${vaultFolderName}...`);
+				this.log(`OmniDrive: Creating sub-folder for vault: ${vaultFolderName}...`);
 				const vaultCreate = await requestUrl({
 					url: 'https://www.googleapis.com/drive/v3/files',
 					method: 'POST',
@@ -1177,8 +1592,8 @@ async syncAttachment(file: TFile) {
 				currentParentID = this.settings.folderMap[currentLocalPath] as string;
 				continue;
 			}
-			const query = encodeURIComponent(`'${currentParentID}' in parents and name='${folderName}' and mimeType='application/vnd.google-apps.folder' and trashed=false`);
-			
+			const safeFolderName = folderName.replace(/'/g, "\\'");
+			const query = encodeURIComponent(`'${currentParentID}' in parents and name='${safeFolderName}' and mimeType='application/vnd.google-apps.folder' and trashed=false`);			
 			try {
 				const searchResponse = await requestUrl({
 					url: `https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id)`,
@@ -1193,7 +1608,7 @@ async syncAttachment(file: TFile) {
 					this.settings.folderMap[currentLocalPath] = currentParentID;
 					await this.saveSettings();
 				} else {
-					this.log(`DriveSync: Creating missing Drive folder (${folderName})`);
+					this.log(`OmniDrive: Creating missing Drive folder (${folderName})`);
 					const createResponse = await requestUrl({
 						url: 'https://www.googleapis.com/drive/v3/files',
 						method: 'POST',
@@ -1243,7 +1658,7 @@ async syncAttachment(file: TFile) {
 					break;
 				}
 			} catch (error) {
-				console.error(`DriveSync: Error crawling Drive path for ${currentID}`, error);
+				console.error(`OmniDrive: Error crawling Drive path for ${currentID}`, error);
 			}
 			depth++;
 		}
@@ -1260,7 +1675,7 @@ async syncAttachment(file: TFile) {
 			if (!abstractFile) {
 				try {
 					await this.app.vault.createFolder(currentLocalPath);
-					this.log(`DriveSync: Built missing local directory (${currentLocalPath})`);
+					this.log(`OmniDrive: Built missing local directory (${currentLocalPath})`);
 				} catch {
 					continue;
 				}
@@ -1294,6 +1709,78 @@ async syncAttachment(file: TFile) {
 		}
 	}
 
+	async verifyRemoteFolder(token: string): Promise<boolean> {
+		if (!this.settings.driveFolderID) return false;
+		try {
+			const response = await requestUrl({
+				url: `https://www.googleapis.com/drive/v3/files/${this.settings.driveFolderID}?fields=id,trashed`,
+				method: 'GET',
+				headers: {'Authorization': `Bearer ${token}`},
+				throw: false
+			});
+			if (response.status < 200 || response.status >= 300) return false;
+			if (response.json.trashed) return false;
+			return true;
+		} catch (error) {
+			return false; // Failsafe that treats it as missing
+		}
+	}
+
+	async ensureLocalDirectoryExists(dir: string) {
+		if (!dir) return;
+		const parts = dir.split('/');
+		let current = "";
+		for (const part of parts) {
+			current += (current === "" ? "" : "/") + part;
+			const folder = this.app.vault.getAbstractFileByPath(current);
+			if (!folder) {
+				try { await this.app.vault.createFolder(current); } catch (e) { /* Ignore: Folder already exists */ }
+			}
+		}
+	}
+
+	async deleteFromDriveOrTombstone(driveID: string, token: string | null) {
+		if (!token) { this.settings.tombstones.push(driveID); return; }
+		try {
+			const response = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files/${driveID}`, method: 'DELETE', headers: {'Authorization': `Bearer ${token}`}, throw: false });
+			// 404 means it's already gone; success, not failure
+			if (response.status >= 400 && response.status !== 404) {
+				this.settings.tombstones.push(driveID);
+			}
+		} catch (e) {
+			this.settings.tombstones.push(driveID);
+		}
+	}
+
+	async moveOrRenameInDrive(driveID: string, file: TAbstractFile, oldPath: string, token: string) {
+		const oldParentPath = oldPath.includes('/') ? oldPath.substring(0, oldPath.lastIndexOf('/')) : "";
+		const newParentPath = file.parent?.path === '/' ? "" : (file.parent?.path ?? "");
+		let patchUrl = `https://www.googleapis.com/drive/v3/files/${driveID}`;
+		const queryParams = [];
+
+		if (oldParentPath !== newParentPath) {
+			const rootFolderID = this.settings.driveFolderID || await this.getCreateDriveFolder();
+			if (rootFolderID) {
+				const newParentID = await this.getTargetFolderID(file.path, rootFolderID, token);
+				const meta = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files/${driveID}?fields=parents`, method: 'GET', headers: {'Authorization': `Bearer ${token}`}, throw: false });
+				
+				if (meta.status === 200) {
+					const parentsArray = meta.json.parents || [];
+					const parentsToRemove = parentsArray.filter((p: string) => p !== newParentID).join(',');
+					if (parentsToRemove) queryParams.push(`removeParents=${parentsToRemove}`);
+					if (!parentsArray.includes(newParentID)) queryParams.push(`addParents=${newParentID}`);
+				}
+			}
+		}
+
+		if (queryParams.length > 0) patchUrl += `?${queryParams.join('&')}`;
+
+		const renameResponse = await requestUrl({ url: patchUrl, method: 'PATCH', headers: {'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json'}, body: JSON.stringify({ name: file.name }), throw: false });
+    	if (renameResponse.status < 200 || renameResponse.status >= 300) {
+    		throw new Error(`Drive rename/move failed with status ${renameResponse.status}`);
+    	}
+	}
+
 	async calculateHash(text: string): Promise<string> {
 		const msgBuffer = new TextEncoder().encode(text);
 
@@ -1310,5 +1797,4 @@ async syncAttachment(file: TFile) {
 		const hashArray = Array.from(new Uint8Array(hashBuffer));
 		return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 	}
-
 }

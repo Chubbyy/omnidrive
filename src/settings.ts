@@ -1,7 +1,7 @@
 import {App, Notice, PluginSettingTab, Setting, SuggestModal} from "obsidian";
-import MyPlugin from "./main";
+import OmniDrive from "./main";
 
-export interface MyPluginSettings {
+export interface OmniDriveSettings {
 	hideIDProperty: boolean;
 	clientID: string;
 	clientSecret: string;
@@ -19,9 +19,10 @@ export interface MyPluginSettings {
 	debugLogging: boolean;
 	ignoredPaths: string;
 	hideAllProperties: boolean;
+	enableSync: boolean;
 }
 
-export const DEFAULT_SETTINGS: MyPluginSettings = {
+export const DEFAULT_SETTINGS: OmniDriveSettings = {
 	hideIDProperty: true,
 	clientID: '',
 	clientSecret: '',
@@ -39,12 +40,13 @@ export const DEFAULT_SETTINGS: MyPluginSettings = {
 	debugLogging: false,
 	ignoredPaths: '',
 	hideAllProperties: false,
+	enableSync: false,
 }
 
-export class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin
+export class OmniDriveSettingTab extends PluginSettingTab {
+	plugin: OmniDrive
 
-	constructor(app: App, plugin: MyPlugin) {
+	constructor(app: App, plugin: OmniDrive) {
 		super(app, plugin);
 		this.plugin = plugin;
 	}
@@ -54,8 +56,24 @@ export class SampleSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		new Setting(containerEl)
-			.setName('Hide DriveSync ID')
-			.setDesc('Hide the DriveSync ID from the Properties table at the top of your files (reopen file to take effect).')
+			.setName('Enable syncing')
+			.setDesc('Master switch to pause or resume all sync operations. Keep this off while configuring your initial setup.')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.enableSync)
+				.onChange(async (value) => {
+					this.plugin.settings.enableSync = value;
+					await this.plugin.saveSettings();
+					
+					if (value) {
+						new Notice('OmniDrive: Sync enabled. Initializing...');
+						this.plugin.syncVault();
+					}
+				})
+			)
+
+		new Setting(containerEl)
+			.setName('Hide OmniDrive ID')
+			.setDesc('Hide the OmniDrive ID from the Properties table at the top of your files.')
 			.addToggle(toggle => toggle
 				.setValue(this.plugin.settings.hideIDProperty)
 				.onChange(async (value) => {
@@ -66,8 +84,8 @@ export class SampleSettingTab extends PluginSettingTab {
 			)
 		
 		new Setting(containerEl)
-			.setName('Hide Properties Table')
-			.setDesc("Completely hide the properties table at the top of all files for a cleaner look (reopen file to take effect).")
+			.setName('Hide properties table')
+			.setDesc("Completely hide the properties table at the top of all files for a cleaner look.")
 			.addToggle(toggle => toggle
 				.setValue(this.plugin.settings.hideAllProperties)
 				.onChange(async (value) => {
@@ -78,12 +96,12 @@ export class SampleSettingTab extends PluginSettingTab {
 			)
 
 		new Setting(containerEl)
-			.setName('Sync Strategy')
-			.setDesc('Two-Way: Mirrors all changes. One-Way Backup: Only pushes local files to Drive. Historic Archive: Only pushes local files, but never deletes files in Drive.')
+			.setName('Sync strategy')
+			.setDesc('Two-way: Mirrors all changes. One-way backup: Only pushes local files to Drive. Historic archive: Only pushes local files, but never deletes files in Drive.')
 			.addDropdown(dropdown => dropdown
-				.addOption('two-way', 'Two-Way Mirror')
-				.addOption('one-way', 'One-Way Backup')
-				.addOption('historic', 'Historic Archive')
+				.addOption('two-way', 'Two-way mirror')
+				.addOption('one-way', 'One-way backup')
+				.addOption('historic', 'Historic archive')
 				.setValue(this.plugin.settings.syncStrategy)
 				.onChange(async (value) => {
 					this.plugin.settings.syncStrategy = value;
@@ -91,7 +109,7 @@ export class SampleSettingTab extends PluginSettingTab {
 				})
 			)
 		new Setting(containerEl)
-			.setName('Ignored Folders')
+			.setName('Ignored folders')
 			.setDesc('Comma-separated list of folders to completely ignore (e.g., Private, Templates/Work).')
 			.addText(text => text
 				.setPlaceholder('Assets, Private, ...')
@@ -103,8 +121,8 @@ export class SampleSettingTab extends PluginSettingTab {
 			)
 		
 		new Setting(containerEl)
-			.setName('Auto-Sync Interval (Minutes)')
-			.setDesc('How often should DriveSync automatically sync in the background? Set to 0 to disable auto-sync.')
+			.setName('Auto-sync interval (minutes)')
+			.setDesc('How often should OmniDrive automatically sync in the background? Set to 0 to disable auto-sync.')
 			.addText(text => text
 				.setPlaceholder('5')
 				.setValue(String(this.plugin.settings.autoSyncInterval))
@@ -120,15 +138,15 @@ export class SampleSettingTab extends PluginSettingTab {
 			)
 		
 		new Setting(containerEl)
-			.setName('Remote Vault Connection')
+			.setName('Remote vault connection')
 			.setDesc(`Currently connected to: [ ${this.plugin.settings.remoteVaultName || "None"} ]. Click to scan Google Drive and link this device to an existing vault, or create a new one.`)
 			.addButton(button => button
-				.setButtonText('Select Remote Vault')
+				.setButtonText('Select remote vault')
 				.setCta()
 				.onClick(async () => {
 					button.setButtonText('Scanning...');
 					const vaults = await this.plugin.scanForRemoteVaults();
-					button.setButtonText('Select Remote Vault');
+					button.setButtonText('Select remote vault');
 					
 					if (vaults !== null) {
 						new VaultSuggestModal(this.app, this.plugin, vaults).open();
@@ -137,7 +155,7 @@ export class SampleSettingTab extends PluginSettingTab {
 			)
 		
 		new Setting(containerEl)
-			.setName('Google Client ID')
+			.setName('Google client ID')
 			.setDesc('Paste the Client ID from your Google Cloud Console.')
 			.addText(text => text
 				.setPlaceholder('Enter Client ID...')
@@ -149,31 +167,53 @@ export class SampleSettingTab extends PluginSettingTab {
 			)
 
 		new Setting(containerEl)
-			.setName('Google Client Secret')
+			.setName('Google client secret')
 			.setDesc('Paste the Client Secret from your Google Cloud Console.')
-			.addText(text => text
+			.addText(text => {
+				text.inputEl.type = 'password';
+				text
 				.setPlaceholder('Enter Client Secret...')
 				.setValue(this.plugin.settings.clientSecret)
 				.onChange(async (value) => {
 					this.plugin.settings.clientSecret = value;
 					await this.plugin.saveSettings();
 				})
-			)
+			})
 		
 		new Setting(containerEl)
 			.setName('Connect to Google Drive')
-			.setDesc('Log in to authorize DriveSync to read and write your files.')
+			.setDesc('Log in to authorize OmniDrive to read and write your files.')
 			.addButton(button => button
 				.setButtonText('Login with Google')
 				.setCta()
 				.onClick(() => {
-					// We moved the logic to main.ts to keep things clean!
 					this.plugin.authenticateGoogle();
 				})
-			) 
+			)
+		
+		let manualAuthInput = "";
+		new Setting(containerEl)
+			.setName('Mobile authentication / manual login')
+			.setDesc('For mobile users: After clicking Login above, your browser will eventually say "Site can\'t be reached". Copy that entire URL and paste it here.')
+			.addText(text => {
+				text
+				.setPlaceholder('http://127.0.0.1:8420/callback?code=...')
+				.onChange((value) => {
+					manualAuthInput = value;
+				});
+			})
+			.addButton(button => button
+				.setButtonText('Verify')
+				.onClick(() => {
+					if (manualAuthInput) {
+						this.plugin.processManualAuth(manualAuthInput);
+					} else {
+						new Notice('Please paste the URL first.');
+					}
+				}));
 			
 		new Setting(containerEl)
-			.setName('Enable Debug Logging')
+			.setName('Enable debug logging')
 			.setDesc('Print verbose sync operation messages to Developer Console. Set to off to keep the console clean.')
 			.addToggle(toggle => toggle
 				.setValue(this.plugin.settings.debugLogging)
@@ -192,10 +232,10 @@ interface RemoteVaultOption {
 }
 
 export class VaultSuggestModal extends SuggestModal<RemoteVaultOption> {
-	plugin: MyPlugin;
+	plugin: OmniDrive;
 	options: RemoteVaultOption[];
 
-	constructor(app: App, plugin: MyPlugin, options: RemoteVaultOption[]) {
+	constructor(app: App, plugin: OmniDrive, options: RemoteVaultOption[]) {
 		super(app);
 		this.plugin = plugin;
 		this.options = options;
@@ -207,7 +247,7 @@ export class VaultSuggestModal extends SuggestModal<RemoteVaultOption> {
 		
 		if (query.trim().length > 0) {
 			matches.unshift({
-				name: `[+ Create New Vault]: "${query}"`,
+				name: `[+ Create new vault]: "${query}"`,
 				id: query,
 				isCreateNew: true,
 			});
@@ -216,25 +256,29 @@ export class VaultSuggestModal extends SuggestModal<RemoteVaultOption> {
 	}
 
 	renderSuggestion(option: RemoteVaultOption, el: HTMLElement): void {
-		el.createEl("div", {text: option.name, cls: option.isCreateNew ? "drivesync-create-new" : ""});
+		el.createEl("div", {text: option.name, cls: option.isCreateNew ? "omnidrive-create-new" : ""});
 	}
 
 	async onChooseSuggestion(option: RemoteVaultOption, evt: MouseEvent | KeyboardEvent) {
-		if (option.isCreateNew) {
-			new Notice(`Creating new remote vault: ${option.id}...`);
-			this.plugin.settings.remoteVaultName = option.id;
-			this.plugin.settings.driveFolderID = "";
-			await this.plugin.saveSettings();
-			await this.plugin.getCreateDriveFolder();
-		} else {
-			new Notice(`Successfully linked to ${option.name}`);
-			this.plugin.settings.remoteVaultName = option.name;
-			this.plugin.settings.driveFolderID = option.id;
-			await this.plugin.saveSettings();
+			if (option.isCreateNew) {
+				new Notice(`Creating new remote vault: ${option.id}...`);
+				this.plugin.settings.remoteVaultName = option.id;
+				this.plugin.settings.driveFolderID = "";
+				await this.plugin.saveSettings();
+				await this.plugin.getCreateDriveFolder();
+			} else {
+				new Notice(`Successfully linked to ${option.name}`);
+				this.plugin.settings.remoteVaultName = option.name;
+				this.plugin.settings.driveFolderID = option.id;
+				await this.plugin.saveSettings();
+			}
+
+			await this.plugin.rebuildIndex();
+
+			try {
+				(this.plugin.app as any).setting.openTabById(this.plugin.manifest.id);
+			} catch (e) {
+				// Fail silently
+			}
 		}
-
-		await this.plugin.rebuildIndex();
-
-		(this.plugin.app as any).setting.openTabById(this.plugin.manifest.id);
-	}
 }

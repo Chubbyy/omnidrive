@@ -1,9 +1,9 @@
-body.drivesync-hide-id .metadata-property[data-property-key="drivesync_id"] {
+body.omnidrive-hide-id .metadata-property[data-property-key="omnidrive_id"] {
    display: none !important; 
 }
 
-body.drivesync-hide-all-properties .metadata-container {
+body.omnidrive-hide-all-properties .metadata-container {
     display: none !important;
 }
 
-.drivesync-create-new { color: var(--text-accent); font-style: italic; }
+.omnidrive-create-new { color: var(--text-accent); font-style: italic; }
