@@ -1,7 +1,7 @@
 {
     "id": "omnidrive",
     "name": "OmniDrive",
-    "version": "1.0.0",
+    "version": "1.0.0-alpha",
     "minAppVersion": "0.15.0",
     "description": "Synchronize your vault with Google Drive using a privacy-first BYOK architecture.",
     "author": "Yom Patel",
