@@ -1,9 +1,30 @@
-import {Notice, Plugin, requestUrl, TFile, TFolder, Platform, TAbstractFile} from 'obsidian';
+import {Notice, Plugin, requestUrl, TFile, TFolder, Platform, TAbstractFile, Modal, App} from 'obsidian';
 import {DEFAULT_SETTINGS, OmniDriveSettings, OmniDriveSettingTab} from "./settings";
 interface OmniDriveOAuthServer {
 	close(): void;
 	on(event: 'error', listener: (err: any) => void): void;
 	listen(port: number, callback: () => void): void;
+}
+
+class OmniDriveDebugLogModal extends Modal {
+	logContent: string;
+	constructor(app: App, logContent: string) {
+		super(app);
+		this.logContent = logContent;
+	}
+	onOpen() {
+		const {contentEl} = this;
+		contentEl.createEl('h3', {text: 'OmniDrive debug log'});
+		const pre = contentEl.createEl('pre');
+		pre.setText(this.logContent || '(log is empty)');
+		pre.style.whiteSpace = 'pre-wrap';
+		pre.style.userSelect = 'text';
+		pre.style.maxHeight = '60vh';
+		pre.style.overflowY = 'auto';
+	}
+	onClose() {
+		this.contentEl.empty();
+	}
 }
 
 export default class OmniDrive extends Plugin {
@@ -368,6 +389,21 @@ export default class OmniDrive extends Plugin {
 			}
 		});
 
+		this.addCommand({
+			id: 'show-debug-log',
+			name: 'Show debug log',
+			callback: async () => {
+				const path = `${this.app.vault.configDir}/plugins/${this.manifest.id}/omnidrive-debug.log`;
+				let content = '(no log yet — enable debug logging, reproduce the issue, then run this again)';
+				try {
+					if (await this.app.vault.adapter.exists(path)) content = await this.app.vault.adapter.read(path);
+				} catch (e) {
+					content = `Failed to read log: ${e}`;
+				}
+				new OmniDriveDebugLogModal(this.app, content).open();
+			}
+		});
+
 		this.startAutoSync();
 
 		// This adds a settings tab so the user can configure various aspects of the plugin
@@ -393,6 +429,21 @@ export default class OmniDrive extends Plugin {
 	enqueueTask(task: () => Promise<void>) {
 		this.syncQueue.push(task);
 		this.processQueue();
+	}
+
+	async logToFile(message: string) {
+		if (!this.settings.debugLogging) return;
+		try {
+			const path = `${this.app.vault.configDir}/plugins/${this.manifest.id}/omnidrive-debug.log`;
+			const line = `[${new Date().toISOString()}] ${message}\n`;
+			if (await this.app.vault.adapter.exists(path)) {
+				await this.app.vault.adapter.append(path, line);
+			} else {
+				await this.app.vault.adapter.write(path, line);
+			}
+		} catch {
+			// Best-effort only; logging must never break sync itself0
+		}
 	}
 
 	async processQueue(): Promise<void> {
@@ -864,6 +915,7 @@ export default class OmniDrive extends Plugin {
 			}
 		} catch (error: any) {
 			console.error(`Sync Error on ${file.name}:`, error);
+			await this.logToFile(`Sync Error on ${file.name}: ${error?.message ?? error}${error?.stack ? '\n' + error.stack : ''}`);
 		}
 	}
 
@@ -1147,9 +1199,16 @@ async syncAttachment(file: TFile) {
 					let url = `https://www.googleapis.com/drive/v3/files?q=${query}&fields=nextPageToken,files(id, name, mimeType, appProperties, parents, modifiedTime)`;
 					if (pageToken) url += `&pageToken=${pageToken}`;
 
-					const search = await requestUrl({ url: url, method: 'GET', headers: {'Authorization': `Bearer ${token}`} });
+					const search = await requestUrl({ url: url, method: 'GET', headers: {'Authorization': `Bearer ${token}`}, throw: false });
+
+					if (search.status < 200 || search.status >= 300) {
+						console.error(`OmniDrive: Folder listing failed for ${current.id} (status ${search.status}).`);
+						await this.logToFile(`Folder listing failed for ${current.id} (status ${search.status})`);
+						return false;
+					}
+
 					const filesInFolder = search.json.files || [];
-					pageToken = search.json.nextPageToken; 
+					pageToken = search.json.nextPageToken;
 
 					for (const file of filesInFolder) {
 						if (file.mimeType === 'application/vnd.google-apps.folder') {
@@ -1265,188 +1324,195 @@ async syncAttachment(file: TFile) {
 			}
 
 			for (const cloudItem of cloudFiles) {
-				const cloudFile = cloudItem.data;
-				const driveID = cloudFile.id;
-				const vsID = cloudFile.appProperties?.omnidrive_id;
+				try {
+					const cloudFile = cloudItem.data;
+					const driveID = cloudFile.id;
+					const vsID = cloudFile.appProperties?.omnidrive_id;
 
-				// Drive doesn't require file extensions. 
-				// If a rename dropped the extension entirely, assume it was accidental and keep whatever extension this file was already tracked with, 
-				// rather than treating it as an intentional type change.
-				let effectiveCloudName = cloudFile.name;
-				let healedMissingExtension = false;
-				if (!cloudFile.name.includes('.')) {
-					const previousPath = Object.keys(this.settings.mdDriveMap).find(p => this.settings.mdDriveMap[p] === driveID)
-						|| Object.keys(this.settings.attachmentMap).find(p => this.settings.attachmentMap[p] === driveID);
-					if (previousPath) {
-						const previousName = previousPath.substring(previousPath.lastIndexOf('/') + 1);
-						const dotIndex = previousName.lastIndexOf('.');
-						if (dotIndex > 0) {
-							effectiveCloudName = cloudFile.name + previousName.substring(dotIndex);
-							healedMissingExtension = true;
-							this.log(`OmniDrive: Drive name "${cloudFile.name}" has no extension. Treating it as "${effectiveCloudName}" (its last known extension).`);
-						}
-					}
-				}
-
-				const fullLocalPath = cloudItem.parentPath === "" ? effectiveCloudName : `${cloudItem.parentPath}/${effectiveCloudName}`;
-
-				if (this.settings.tombstones.includes(driveID) || (vsID && this.settings.tombstones.includes(vsID))) {
-					this.log(`OmniDrive: Ghost file detected. Removing ${cloudFile.name} from Drive...`);
-					const delResponse = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files/${driveID}`, method: 'DELETE', headers: {'Authorization': `Bearer ${token}`}, throw: false });
-					
-					if (delResponse.status >= 400) {
-						console.error(`Failed to delete ghost file ${cloudFile.name} (status ${delResponse.status}):`, delResponse.json || delResponse.text);
-					} else {
-						this.settings.tombstones = this.settings.tombstones.filter(id => id !== driveID && id !== vsID);
-					}
-					
-					await this.saveSettings();
-					continue;
-				}
-
-				const isMarkdown = effectiveCloudName.endsWith('.md');
-				let knownPath = null;
-				let wasMarkdown = isMarkdown;
-
-				if (isMarkdown) {
-					knownPath = Object.keys(this.settings.mdDriveMap).find(p => this.settings.mdDriveMap[p] === driveID);
-					if (!knownPath) {
-						knownPath = Object.keys(this.settings.attachmentMap).find(p => this.settings.attachmentMap[p] === driveID);
-						wasMarkdown = false;
-					}
-				} else {
-					knownPath = Object.keys(this.settings.attachmentMap).find(p => this.settings.attachmentMap[p] === driveID);
-					if (!knownPath) {
-						knownPath = Object.keys(this.settings.mdDriveMap).find(p => this.settings.mdDriveMap[p] === driveID);
-						wasMarkdown = true;
-					}
-				}
-
-				if (knownPath && knownPath !== fullLocalPath && !this.isPathIgnored(fullLocalPath)) {
-					if (this.settings.syncStrategy === 'two-way') {
-						if (wasMarkdown !== isMarkdown) {
-							console.warn(`OmniDrive: Drive rename of "${knownPath}" to "${fullLocalPath}" would change its type (Markdown ↔ attachment). Skipping automatic mirror to avoid corrupting the file — rename it back to a matching extension in Drive, or rename the local file directly, to resolve.`);
-							continue;
-						}
-						this.log(`OmniDrive: Remote file rename detected. Renaming locally from ${knownPath} to ${fullLocalPath}...`);
-						const abstractFile = this.app.vault.getAbstractFileByPath(knownPath);
-						if (abstractFile) {
-							if (cloudItem.parentPath) await this.ensureLocalDirectoryExists(cloudItem.parentPath);
-							try {
-								await this.app.fileManager.renameFile(abstractFile, fullLocalPath);
-
-								if (wasMarkdown) {
-									delete this.settings.mdDriveMap[knownPath];
-									delete this.settings.mdFileMap[knownPath];
-								} else {
-									delete this.settings.attachmentMap[knownPath];
-								}
-
-								if (isMarkdown) {
-									this.settings.mdDriveMap[fullLocalPath] = driveID;
-									if (vsID) this.settings.mdFileMap[fullLocalPath] = vsID;
-								} else {
-									this.settings.attachmentMap[fullLocalPath] = driveID;
-								}
-
-								if (this.settings.syncState[knownPath]) {
-									this.settings.syncState[fullLocalPath] = this.settings.syncState[knownPath] as string;
-									delete this.settings.syncState[knownPath];
-								}
-								await this.saveSettings();
-
-								if (healedMissingExtension) {
-									try {
-										await this.moveOrRenameInDrive(driveID, abstractFile, knownPath, token);
-									} catch (e) {
-										console.warn(`OmniDrive: Renamed locally, but failed to push the corrected extension back to Drive for ${fullLocalPath}.`, e);
-									}
-								}
-							} catch(e) {
-								console.warn(`OmniDrive: Failed to locally rename file to ${fullLocalPath}`, e);
+					// Drive doesn't require file extensions. 
+					// If a rename dropped the extension entirely, assume it was accidental and keep whatever extension this file was already tracked with, 
+					// rather than treating it as an intentional type change.
+					let effectiveCloudName = cloudFile.name;
+					let healedMissingExtension = false;
+					if (!cloudFile.name.includes('.')) {
+						const previousPath = Object.keys(this.settings.mdDriveMap).find(p => this.settings.mdDriveMap[p] === driveID)
+							|| Object.keys(this.settings.attachmentMap).find(p => this.settings.attachmentMap[p] === driveID);
+						if (previousPath) {
+							const previousName = previousPath.substring(previousPath.lastIndexOf('/') + 1);
+							const dotIndex = previousName.lastIndexOf('.');
+							if (dotIndex > 0) {
+								effectiveCloudName = cloudFile.name + previousName.substring(dotIndex);
+								healedMissingExtension = true;
+								this.log(`OmniDrive: Drive name "${cloudFile.name}" has no extension. Treating it as "${effectiveCloudName}" (its last known extension).`);
 							}
 						}
-					} else {
-						this.log(`OmniDrive: Drive-side rename ignored (${this.settings.syncStrategy} mode): ${knownPath}`);
 					}
-				}
 
-				if (this.settings.syncStrategy === 'two-way') {
-					if (isMarkdown) {
-						const alreadyTracked = Object.values(this.settings.mdDriveMap).includes(driveID);
-						const alreadyLocal = this.app.vault.getAbstractFileByPath(fullLocalPath) !== null;
+					const fullLocalPath = cloudItem.parentPath === "" ? effectiveCloudName : `${cloudItem.parentPath}/${effectiveCloudName}`;
 
-						if (!alreadyTracked && !alreadyLocal) {
-							this.log(`OmniDrive: New .md file detected in Drive. Downloading ${cloudFile.name}...`);
-							if (this.isPathIgnored(fullLocalPath)) continue;
-							const dl = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files/${driveID}?alt=media`, headers: {'Authorization': `Bearer ${token}`}, throw: false });
-							if (dl.status === 200) {
-								if (cloudItem.parentPath) await this.ensureLocalDirectoryExists(cloudItem.parentPath);
-								const newFile = await this.app.vault.create(fullLocalPath, dl.text);
-								
-								if (vsID) {
-									// Drive object already carries our ID (e.g., a retried patch); rare occurrence. Link immediately
-									this.settings.mdFileMap[fullLocalPath] = vsID;
-									this.settings.mdDriveMap[fullLocalPath] = driveID;
-									this.settings.syncState[vsID] = await this.calculateHash(dl.text);
-									await this.saveSettings();
-								} else {
-									// User manually uploaded this file to Drive, so it lacks an ID. Give it one, push it to Drive (metadata + body), and only record a
-									// syncState baseline if BOTH pushes actually succeeded. If either fails, leave syncState unset; next sync will then see a real
-									// mismatch and route through normal conflict handling (backs up the cloud copy) instead of silently losing the ID
-									const newID = window.crypto.randomUUID();
-									await this.app.fileManager.processFrontMatter(newFile, (fm) => {
-										fm['omnidrive_id'] = newID;
-									});
-
-									const updatedContent = await this.app.vault.read(newFile);
-
-									const metaPatch = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files/${driveID}`, method: 'PATCH', headers: {'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json'}, body: JSON.stringify({ appProperties: { omnidrive_id: newID } }), throw: false });
-									const contentPatch = await requestUrl({ url: `https://www.googleapis.com/upload/drive/v3/files/${driveID}?uploadType=media`, method: 'PATCH', headers: {'Authorization': `Bearer ${token}`, 'Content-Type': 'text/plain'}, body: updatedContent, throw: false });
-
-									this.settings.mdFileMap[fullLocalPath] = newID;
-									this.settings.mdDriveMap[fullLocalPath] = driveID;
-
-									if (metaPatch.status >= 200 && metaPatch.status < 300 && contentPatch.status >= 200 && contentPatch.status < 300) {
-										this.settings.syncState[newID] = await this.calculateHash(updatedContent);
-									} else {
-										console.error(`OmniDrive: Failed to push omnidrive_id back to Drive for ${newFile.name} (meta: ${metaPatch.status}, content: ${contentPatch.status}).`);
-									}
-									await this.saveSettings();
-								}
-							}
-						}
-					} else if (!isMarkdown) {
-						const alreadyTrackedAttachment = Object.values(this.settings.attachmentMap).includes(driveID);
-						const alreadyLocalAttachment = this.app.vault.getAbstractFileByPath(fullLocalPath) !== null;
+					if (this.settings.tombstones.includes(driveID) || (vsID && this.settings.tombstones.includes(vsID))) {
+						this.log(`OmniDrive: Ghost file detected. Removing ${cloudFile.name} from Drive...`);
+						const delResponse = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files/${driveID}`, method: 'DELETE', headers: {'Authorization': `Bearer ${token}`}, throw: false });
 						
-						if (!alreadyTrackedAttachment) {
-							if (alreadyLocalAttachment) {
-								this.log(`OmniDrive: Untracked local file already exists at ${fullLocalPath}. Skipping download; will be linked during outbound sync.`);
-							} else {
-								this.log(`OmniDrive: New cloud attachment detected. Downloading ${cloudFile.name}...`);
-								if (this.isPathIgnored(fullLocalPath)) continue;
+						if (delResponse.status >= 400) {
+							console.error(`Failed to delete ghost file ${cloudFile.name} (status ${delResponse.status}):`, delResponse.json || delResponse.text);
+						} else {
+							this.settings.tombstones = this.settings.tombstones.filter(id => id !== driveID && id !== vsID);
+						}
+						
+						await this.saveSettings();
+						continue;
+					}
+
+					const isMarkdown = effectiveCloudName.endsWith('.md');
+					let knownPath = null;
+					let wasMarkdown = isMarkdown;
+
+					if (isMarkdown) {
+						knownPath = Object.keys(this.settings.mdDriveMap).find(p => this.settings.mdDriveMap[p] === driveID);
+						if (!knownPath) {
+							knownPath = Object.keys(this.settings.attachmentMap).find(p => this.settings.attachmentMap[p] === driveID);
+							wasMarkdown = false;
+						}
+					} else {
+						knownPath = Object.keys(this.settings.attachmentMap).find(p => this.settings.attachmentMap[p] === driveID);
+						if (!knownPath) {
+							knownPath = Object.keys(this.settings.mdDriveMap).find(p => this.settings.mdDriveMap[p] === driveID);
+							wasMarkdown = true;
+						}
+					}
+
+					if (knownPath && knownPath !== fullLocalPath && !this.isPathIgnored(fullLocalPath)) {
+						if (this.settings.syncStrategy === 'two-way') {
+							if (wasMarkdown !== isMarkdown) {
+								console.warn(`OmniDrive: Drive rename of "${knownPath}" to "${fullLocalPath}" would change its type (Markdown ↔ attachment). Skipping automatic mirror to avoid corrupting the file — rename it back to a matching extension in Drive, or rename the local file directly, to resolve.`);
+								continue;
+							}
+							this.log(`OmniDrive: Remote file rename detected. Renaming locally from ${knownPath} to ${fullLocalPath}...`);
+							const abstractFile = this.app.vault.getAbstractFileByPath(knownPath);
+							if (abstractFile) {
+								if (cloudItem.parentPath) await this.ensureLocalDirectoryExists(cloudItem.parentPath);
 								try {
-									const dl = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files/${driveID}?alt=media`, headers: {'Authorization': `Bearer ${token}`}, throw: false });
-									if (dl.status === 200) {
-										if (cloudItem.parentPath) await this.ensureLocalDirectoryExists(cloudItem.parentPath);
-										const newFile = await this.app.vault.createBinary(fullLocalPath, dl.arrayBuffer);
-										const currentCloudMTime = cloudFile.modifiedTime ? new Date(cloudFile.modifiedTime).getTime().toString() : "";
+									await this.app.fileManager.renameFile(abstractFile, fullLocalPath);
+
+									if (wasMarkdown) {
+										delete this.settings.mdDriveMap[knownPath];
+										delete this.settings.mdFileMap[knownPath];
+									} else {
+										delete this.settings.attachmentMap[knownPath];
+									}
+
+									if (isMarkdown) {
+										this.settings.mdDriveMap[fullLocalPath] = driveID;
+										if (vsID) this.settings.mdFileMap[fullLocalPath] = vsID;
+									} else {
 										this.settings.attachmentMap[fullLocalPath] = driveID;
-										this.settings.syncState[fullLocalPath] = `${newFile.stat.mtime.toString()}|${currentCloudMTime}`;
+									}
+
+									if (this.settings.syncState[knownPath]) {
+										this.settings.syncState[fullLocalPath] = this.settings.syncState[knownPath] as string;
+										delete this.settings.syncState[knownPath];
+									}
+									await this.saveSettings();
+
+									if (healedMissingExtension) {
+										try {
+											await this.moveOrRenameInDrive(driveID, abstractFile, knownPath, token);
+										} catch (e) {
+											console.warn(`OmniDrive: Renamed locally, but failed to push the corrected extension back to Drive for ${fullLocalPath}.`, e);
+										}
+									}
+								} catch(e) {
+									console.warn(`OmniDrive: Failed to locally rename file to ${fullLocalPath}`, e);
+								}
+							}
+						} else {
+							this.log(`OmniDrive: Drive-side rename ignored (${this.settings.syncStrategy} mode): ${knownPath}`);
+						}
+					}
+
+					if (this.settings.syncStrategy === 'two-way') {
+						if (isMarkdown) {
+							const alreadyTracked = Object.values(this.settings.mdDriveMap).includes(driveID);
+							const alreadyLocal = this.app.vault.getAbstractFileByPath(fullLocalPath) !== null;
+
+							if (!alreadyTracked && !alreadyLocal) {
+								this.log(`OmniDrive: New .md file detected in Drive. Downloading ${cloudFile.name}...`);
+								if (this.isPathIgnored(fullLocalPath)) continue;
+								const dl = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files/${driveID}?alt=media`, headers: {'Authorization': `Bearer ${token}`}, throw: false });
+								if (dl.status === 200) {
+									if (cloudItem.parentPath) await this.ensureLocalDirectoryExists(cloudItem.parentPath);
+									const newFile = await this.app.vault.create(fullLocalPath, dl.text);
+									
+									if (vsID) {
+										// Drive object already carries our ID (e.g., a retried patch); rare occurrence. Link immediately
+										this.settings.mdFileMap[fullLocalPath] = vsID;
+										this.settings.mdDriveMap[fullLocalPath] = driveID;
+										this.settings.syncState[vsID] = await this.calculateHash(dl.text);
+										await this.saveSettings();
+									} else {
+										// User manually uploaded this file to Drive, so it lacks an ID. Give it one, push it to Drive (metadata + body), and only record a
+										// syncState baseline if BOTH pushes actually succeeded. If either fails, leave syncState unset; next sync will then see a real
+										// mismatch and route through normal conflict handling (backs up the cloud copy) instead of silently losing the ID
+										const newID = window.crypto.randomUUID();
+										await this.app.fileManager.processFrontMatter(newFile, (fm) => {
+											fm['omnidrive_id'] = newID;
+										});
+
+										const updatedContent = await this.app.vault.read(newFile);
+
+										const metaPatch = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files/${driveID}`, method: 'PATCH', headers: {'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json'}, body: JSON.stringify({ appProperties: { omnidrive_id: newID } }), throw: false });
+										const contentPatch = await requestUrl({ url: `https://www.googleapis.com/upload/drive/v3/files/${driveID}?uploadType=media`, method: 'PATCH', headers: {'Authorization': `Bearer ${token}`, 'Content-Type': 'text/plain'}, body: updatedContent, throw: false });
+
+										this.settings.mdFileMap[fullLocalPath] = newID;
+										this.settings.mdDriveMap[fullLocalPath] = driveID;
+
+										if (metaPatch.status >= 200 && metaPatch.status < 300 && contentPatch.status >= 200 && contentPatch.status < 300) {
+											this.settings.syncState[newID] = await this.calculateHash(updatedContent);
+										} else {
+											console.error(`OmniDrive: Failed to push omnidrive_id back to Drive for ${newFile.name} (meta: ${metaPatch.status}, content: ${contentPatch.status}).`);
+										}
 										await this.saveSettings();
 									}
-								} catch (e) {
-									console.error(`OmniDrive: Failed to download new attachment ${cloudFile.name}:`, e);
+								}
+							}
+						} else if (!isMarkdown) {
+							const alreadyTrackedAttachment = Object.values(this.settings.attachmentMap).includes(driveID);
+							const alreadyLocalAttachment = this.app.vault.getAbstractFileByPath(fullLocalPath) !== null;
+							
+							if (!alreadyTrackedAttachment) {
+								if (alreadyLocalAttachment) {
+									this.log(`OmniDrive: Untracked local file already exists at ${fullLocalPath}. Skipping download; will be linked during outbound sync.`);
+								} else {
+									this.log(`OmniDrive: New cloud attachment detected. Downloading ${cloudFile.name}...`);
+									if (this.isPathIgnored(fullLocalPath)) continue;
+									try {
+										const dl = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files/${driveID}?alt=media`, headers: {'Authorization': `Bearer ${token}`}, throw: false });
+										if (dl.status === 200) {
+											if (cloudItem.parentPath) await this.ensureLocalDirectoryExists(cloudItem.parentPath);
+											const newFile = await this.app.vault.createBinary(fullLocalPath, dl.arrayBuffer);
+											const currentCloudMTime = cloudFile.modifiedTime ? new Date(cloudFile.modifiedTime).getTime().toString() : "";
+											this.settings.attachmentMap[fullLocalPath] = driveID;
+											this.settings.syncState[fullLocalPath] = `${newFile.stat.mtime.toString()}|${currentCloudMTime}`;
+											await this.saveSettings();
+										}
+									} catch (e) {
+										console.error(`OmniDrive: Failed to download new attachment ${cloudFile.name}:`, e);
+									}
 								}
 							}
 						}
 					}
+				} catch (itemError) {
+					console.error(`OmniDrive: Failed processing cloud item ${cloudItem.data.name}:`, itemError);
+					await this.logToFile(`Failed processing cloud item ${cloudItem.data.name}: ${itemError}`);
+					continue;
 				}
 			}
-			return true;
+		return true;
 		} catch (error) {
 			console.error("Cloud Pull Error:", error);
+			await this.logToFile(`Cloud Pull Error: ${(error as any)?.message ?? error}${(error as any)?.stack ? '\n' + (error as any).stack : ''}`);
 			return false;
 		}
 	}
