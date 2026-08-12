@@ -1192,7 +1192,7 @@ async syncAttachment(file: TFile) {
 
 				do {
 					const query = encodeURIComponent(`'${current.id}' in parents and trashed=false`);
-					let url = `https://www.googleapis.com/drive/v3/files?q=${query}&fields=nextPageToken,files(id, name, mimeType, appProperties, parents, modifiedTime)`;
+					let url = `https://www.googleapis.com/drive/v3/files?q=${query}&fields=nextPageToken,files(id,name,mimeType,appProperties,parents,modifiedTime)`;
 					if (pageToken) url += `&pageToken=${pageToken}`;
 
 					const search = await requestUrl({ url: url, method: 'GET', headers: {'Authorization': `Bearer ${token}`}, throw: false });
