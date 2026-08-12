@@ -16,11 +16,7 @@ class OmniDriveDebugLogModal extends Modal {
 		const {contentEl} = this;
 		contentEl.createEl('h3', {text: 'OmniDrive debug log'});
 		const pre = contentEl.createEl('pre');
-		pre.setText(this.logContent || '(log is empty)');
-		pre.style.whiteSpace = 'pre-wrap';
-		pre.style.userSelect = 'text';
-		pre.style.maxHeight = '60vh';
-		pre.style.overflowY = 'auto';
+		pre.addClass('omnidrive-debug-log');
 	}
 	onClose() {
 		this.contentEl.empty();
@@ -398,7 +394,7 @@ export default class OmniDrive extends Plugin {
 				try {
 					if (await this.app.vault.adapter.exists(path)) content = await this.app.vault.adapter.read(path);
 				} catch (e) {
-					content = `Failed to read log: ${e}`;
+					content = `Failed to read log: ${String(e)}`;
 				}
 				new OmniDriveDebugLogModal(this.app, content).open();
 			}
@@ -1505,7 +1501,7 @@ async syncAttachment(file: TFile) {
 					}
 				} catch (itemError) {
 					console.error(`OmniDrive: Failed processing cloud item ${cloudItem.data.name}:`, itemError);
-					await this.logToFile(`Failed processing cloud item ${cloudItem.data.name}: ${itemError}`);
+					await this.logToFile(`Failed processing cloud item ${cloudItem.data.name}: ${String(itemError)}`);
 					continue;
 				}
 			}
