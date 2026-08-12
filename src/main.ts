@@ -17,6 +17,7 @@ class OmniDriveDebugLogModal extends Modal {
 		contentEl.createEl('h3', {text: 'OmniDrive debug log'});
 		const pre = contentEl.createEl('pre');
 		pre.addClass('omnidrive-debug-log');
+		pre.setText(this.logContent);
 	}
 	onClose() {
 		this.contentEl.empty();
@@ -390,13 +391,31 @@ export default class OmniDrive extends Plugin {
 			name: 'Show debug log',
 			callback: async () => {
 				const path = `${this.app.vault.configDir}/plugins/${this.manifest.id}/omnidrive-debug.log`;
-				let content = '(no log yet — enable debug logging, reproduce the issue, then run this again)';
+				let content = '(no log yet: enable debug logging, reproduce the issue, then run this again)';
 				try {
 					if (await this.app.vault.adapter.exists(path)) content = await this.app.vault.adapter.read(path);
 				} catch (e) {
 					content = `Failed to read log: ${String(e)}`;
 				}
 				new OmniDriveDebugLogModal(this.app, content).open();
+			}
+		});
+
+		this.addCommand({
+			id: 'clear-debug-log',
+			name: 'Clear debug log',
+			callback: async () => {
+				const path = `${this.app.vault.configDir}/plugins/${this.manifest.id}/omnidrive-debug.log`;
+				try {
+					if (await this.app.vault.adapter.exists(path)) {
+						await this.app.vault.adapter.write(path, '');
+						new Notice('OmniDrive: Debug log cleared.');
+					} else {
+						new Notice('OmniDrive: No debug log found to clear.');
+					}
+				} catch (e) {
+					new Notice(`Failed to clear log: ${String(e)}`);
+				}
 			}
 		});
 
@@ -410,6 +429,8 @@ export default class OmniDrive extends Plugin {
 	log(message: string) {
 		if (this.settings.debugLogging) {
 			console.debug(message);
+			// Fire and forget the file write so it never slows down the sync engine
+			this.logToFile(message).catch(() => {});
 		}
 	}
 
