@@ -1198,8 +1198,10 @@ async syncAttachment(file: TFile) {
 					const search = await requestUrl({ url: url, method: 'GET', headers: {'Authorization': `Bearer ${token}`}, throw: false });
 
 					if (search.status < 200 || search.status >= 300) {
-						console.error(`OmniDrive: Folder listing failed for ${current.id} (status ${search.status}).`);
-						await this.logToFile(`Folder listing failed for ${current.id} (status ${search.status})`);
+						const errorBody = search.json ?? search.text;
+						console.error(`OmniDrive: Folder listing failed for ${current.id} ` + `(status ${search.status}):`, errorBody);
+						await this.logToFile(`Folder listing failed for ${current.id} (status ${search.status}): ` + `${JSON.stringify(errorBody)}`);
+						this.logToFile(`Listing folder ${current.id}, path="${current.path}", `+ `pageToken=${pageToken ? 'present' : 'none'}`);
 						return false;
 					}
 
