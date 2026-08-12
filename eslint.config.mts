@@ -15,7 +15,14 @@ export default tseslint.config(
 			},
 		},
 		rules: {
-			"obsidianmd/ui/sentence-case": "off",
+			"obsidianmd/ui/sentence-case": [
+				"error",
+				{
+					brands: ["OmniDrive", "Google Drive"],
+					acronyms: ["ID", "API", "OAuth"],
+					allowAutoFix: true,
+				},
+			],
 			"@typescript-eslint/no-explicit-any": "off",
 			"@typescript-eslint/no-unsafe-assignment": "off",
 			"@typescript-eslint/no-unsafe-member-access": "off",

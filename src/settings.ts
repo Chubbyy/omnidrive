@@ -1,4 +1,4 @@
-import {App, Notice, PluginSettingTab, Setting, SuggestModal} from "obsidian";
+import {App, Notice, PluginSettingTab, Setting, SettingDefinitionItem, SuggestModal} from "obsidian";
 import OmniDrive from "./main";
 
 export interface OmniDriveSettings {
@@ -51,177 +51,205 @@ export class OmniDriveSettingTab extends PluginSettingTab {
 		this.plugin = plugin;
 	}
 
-	display(): void {
-		const {containerEl} = this;
-		containerEl.empty();
-
-		new Setting(containerEl)
-			.setName('Enable syncing')
-			.setDesc('Master switch to pause or resume all sync operations. Keep this off while configuring your initial setup.')
-			.addToggle(toggle => toggle
-				.setValue(this.plugin.settings.enableSync)
-				.onChange(async (value) => {
-					this.plugin.settings.enableSync = value;
-					await this.plugin.saveSettings();
-					
-					if (value) {
-						new Notice('OmniDrive: Sync enabled. Initializing...');
-						this.plugin.syncVault();
-					}
-				})
-			)
-
-		new Setting(containerEl)
-			.setName('Hide OmniDrive ID')
-			.setDesc('Hide the OmniDrive ID from the Properties table at the top of your files.')
-			.addToggle(toggle => toggle
-				.setValue(this.plugin.settings.hideIDProperty)
-				.onChange(async (value) => {
-					this.plugin.settings.hideIDProperty = value;
-					await this.plugin.saveSettings();
-					this.plugin.toggleIDVisibility();
-				})
-			)
-		
-		new Setting(containerEl)
-			.setName('Hide properties table')
-			.setDesc("Completely hide the properties table at the top of all files for a cleaner look.")
-			.addToggle(toggle => toggle
-				.setValue(this.plugin.settings.hideAllProperties)
-				.onChange(async (value) => {
-					this.plugin.settings.hideAllProperties = value;
-					await this.plugin.saveSettings();
-					this.plugin.toggleIDVisibility();
-				})
-			)
-
-		new Setting(containerEl)
-			.setName('Sync strategy')
-			.setDesc('Two-way: Mirrors all changes. One-way backup: Only pushes local files to Drive. Historic archive: Only pushes local files, but never deletes files in Drive.')
-			.addDropdown(dropdown => dropdown
-				.addOption('two-way', 'Two-way mirror')
-				.addOption('one-way', 'One-way backup')
-				.addOption('historic', 'Historic archive')
-				.setValue(this.plugin.settings.syncStrategy)
-				.onChange(async (value) => {
-					this.plugin.settings.syncStrategy = value;
-					await this.plugin.saveSettings();
-				})
-			)
-		new Setting(containerEl)
-			.setName('Ignored folders')
-			.setDesc('Comma-separated list of folders to completely ignore (e.g., Private, Templates/Work).')
-			.addText(text => text
-				.setPlaceholder('Assets, Private, ...')
-				.setValue(this.plugin.settings.ignoredPaths)
-				.onChange(async (value) => {
-					this.plugin.settings.ignoredPaths = value;
-					await this.plugin.saveSettings();
-				})
-			)
-		
-		new Setting(containerEl)
-			.setName('Auto-sync interval (minutes)')
-			.setDesc('How often should OmniDrive automatically sync in the background? Set to 0 to disable auto-sync.')
-			.addText(text => text
-				.setPlaceholder('5')
-				.setValue(String(this.plugin.settings.autoSyncInterval))
-				.onChange(async (value) => {
-					const parsed = parseInt(value, 10);
-					if (!isNaN(parsed) && parsed >= 0) {
-						this.plugin.settings.autoSyncInterval = parsed;
-						await this.plugin.saveSettings();
-
-						this.plugin.startAutoSync();
-					}
-				})
-			)
-		
-		new Setting(containerEl)
-			.setName('Remote vault connection')
-			.setDesc(`Currently connected to: [ ${this.plugin.settings.remoteVaultName || "None"} ]. Click to scan Google Drive and link this device to an existing vault, or create a new one.`)
-			.addButton(button => button
-				.setButtonText('Select remote vault')
-				.setCta()
-				.onClick(async () => {
-					button.setButtonText('Scanning...');
-					const vaults = await this.plugin.scanForRemoteVaults();
-					button.setButtonText('Select remote vault');
-					
-					if (vaults !== null) {
-						new VaultSuggestModal(this.app, this.plugin, vaults).open();
-					}
-				})
-			)
-		
-		new Setting(containerEl)
-			.setName('Google client ID')
-			.setDesc('Paste the Client ID from your Google Cloud Console.')
-			.addText(text => text
-				.setPlaceholder('Enter Client ID...')
-				.setValue(this.plugin.settings.clientID)
-				.onChange(async (value) => {
-					this.plugin.settings.clientID = value;
-					await this.plugin.saveSettings();
-				})
-			)
-
-		new Setting(containerEl)
-			.setName('Google client secret')
-			.setDesc('Paste the Client Secret from your Google Cloud Console.')
-			.addText(text => {
-				text.inputEl.type = 'password';
-				text
-				.setPlaceholder('Enter Client Secret...')
-				.setValue(this.plugin.settings.clientSecret)
-				.onChange(async (value) => {
-					this.plugin.settings.clientSecret = value;
-					await this.plugin.saveSettings();
-				})
-			})
-		
-		new Setting(containerEl)
-			.setName('Connect to Google Drive')
-			.setDesc('Log in to authorize OmniDrive to read and write your files.')
-			.addButton(button => button
-				.setButtonText('Login with Google')
-				.setCta()
-				.onClick(() => {
-					this.plugin.authenticateGoogle();
-				})
-			)
-		
+	getSettingDefinitions(): SettingDefinitionItem[] {
 		let manualAuthInput = "";
-		new Setting(containerEl)
-			.setName('Mobile authentication / manual login')
-			.setDesc('For mobile users: After clicking Login above, your browser will eventually say "Site can\'t be reached". Copy that entire URL and paste it here.')
-			.addText(text => {
-				text
-				.setPlaceholder('http://127.0.0.1:8420/callback?code=...')
-				.onChange((value) => {
-					manualAuthInput = value;
-				});
-			})
-			.addButton(button => button
-				.setButtonText('Verify')
-				.onClick(() => {
-					if (manualAuthInput) {
-						this.plugin.processManualAuth(manualAuthInput);
-					} else {
-						new Notice('Please paste the URL first.');
-					}
-				}));
-			
-		new Setting(containerEl)
-			.setName('Enable debug logging')
-			.setDesc('Print verbose sync operation messages to Developer Console. Set to off to keep the console clean.')
-			.addToggle(toggle => toggle
-				.setValue(this.plugin.settings.debugLogging)
-				.onChange(async (value) => {
-					this.plugin.settings.debugLogging = value;
-					await this.plugin.saveSettings();
-				})
-			)
+
+		return [
+			{
+				name: 'Enable syncing',
+				desc: 'Master switch to pause or resume all sync operations. Keep this off while configuring your initial setup.',
+				render: (setting: Setting) => {
+					setting.addToggle(toggle => toggle
+						.setValue(this.plugin.settings.enableSync)
+						.onChange(async (value) => {
+							this.plugin.settings.enableSync = value;
+							await this.plugin.saveSettings();
+
+							if (value) {
+								new Notice('OmniDrive: sync enabled. Initializing...');
+								this.plugin.syncVault();
+							}
+						})
+					);
+				}
+			},
+			{
+				name: 'Hide OmniDrive ID',
+				desc: 'Hide the OmniDrive ID from the properties table at the top of your files.',
+				render: (setting: Setting) => {
+					setting.addToggle(toggle => toggle
+						.setValue(this.plugin.settings.hideIDProperty)
+						.onChange(async (value) => {
+							this.plugin.settings.hideIDProperty = value;
+							await this.plugin.saveSettings();
+							this.plugin.toggleIDVisibility();
+						})
+					);
+				}
+			},
+			{
+				name: 'Hide properties table',
+				desc: "Completely hide the properties table at the top of all files for a cleaner look.",
+				render: (setting: Setting) => {
+					setting.addToggle(toggle => toggle
+						.setValue(this.plugin.settings.hideAllProperties)
+						.onChange(async (value) => {
+							this.plugin.settings.hideAllProperties = value;
+							await this.plugin.saveSettings();
+							this.plugin.toggleIDVisibility();
+						})
+					);
+				}
+			},
+			{
+				name: 'Sync strategy',
+				desc: 'Two-way: mirrors all changes. One-way backup: only pushes local files to drive. Historic archive: only pushes local files, but never deletes files in drive.',
+				render: (setting: Setting) => {
+					setting.addDropdown(dropdown => dropdown
+						.addOption('two-way', 'Two-way mirror')
+						.addOption('one-way', 'One-way backup')
+						.addOption('historic', 'Historic archive')
+						.setValue(this.plugin.settings.syncStrategy)
+						.onChange(async (value) => {
+							this.plugin.settings.syncStrategy = value;
+							await this.plugin.saveSettings();
+						})
+					);
+				}
+			},
+			{
+				name: 'Ignored folders',
+				desc: 'Comma-separated list of folders to completely ignore (e.g., private, templates/work).',
+				render: (setting: Setting) => {
+					setting.addText(text => text
+						.setPlaceholder('Assets, private, ...')
+						.setValue(this.plugin.settings.ignoredPaths)
+						.onChange(async (value) => {
+							this.plugin.settings.ignoredPaths = value;
+							await this.plugin.saveSettings();
+						})
+					);
+				}
+			},
+			{
+				name: 'Auto-sync interval (minutes)',
+				desc: 'How often should OmniDrive automatically sync in the background? Set to 0 to disable auto-sync.',
+				render: (setting: Setting) => {
+					setting.addText(text => text
+						.setPlaceholder('5')
+						.setValue(String(this.plugin.settings.autoSyncInterval))
+						.onChange(async (value) => {
+							const parsed = parseInt(value, 10);
+							if (!isNaN(parsed) && parsed >= 0) {
+								this.plugin.settings.autoSyncInterval = parsed;
+								await this.plugin.saveSettings();
+
+								this.plugin.startAutoSync();
+							}
+						})
+					);
+				}
+			},
+			{
+				name: 'Remote vault connection',
+				desc: `Currently connected to: [ ${this.plugin.settings.remoteVaultName || "None"} ]. Click to scan Google Drive and link this device to an existing vault, or create a new one.`,
+				render: (setting: Setting) => {
+					setting.addButton(button => button
+						.setButtonText('Select remote vault')
+						.setCta()
+						.onClick(async () => {
+							button.setButtonText('Scanning...');
+							const vaults = await this.plugin.scanForRemoteVaults();
+							button.setButtonText('Select remote vault');
+
+							if (vaults !== null) {
+								new VaultSuggestModal(this.app, this.plugin, vaults).open();
+							}
+						})
+					);
+				}
+			},
+			{
+				name: 'Google client ID',
+				desc: 'Paste the client ID from your google cloud console.',
+				render: (setting: Setting) => {
+					setting.addText(text => text
+						.setPlaceholder('Enter client ID...')
+						.setValue(this.plugin.settings.clientID)
+						.onChange(async (value) => {
+							this.plugin.settings.clientID = value;
+							await this.plugin.saveSettings();
+						})
+					);
+				}
+			},
+			{
+				name: 'Google client secret',
+				desc: 'Paste the client secret from your google cloud console.',
+				render: (setting: Setting) => {
+					setting.addText(text => {
+						text.inputEl.type = 'password';
+						text
+							.setPlaceholder('Enter client secret...')
+							.setValue(this.plugin.settings.clientSecret)
+							.onChange(async (value) => {
+								this.plugin.settings.clientSecret = value;
+								await this.plugin.saveSettings();
+							})
+					});
+				}
+			},
+			{
+				name: 'Connect to Google Drive',
+				desc: 'Log in to authorize OmniDrive to read and write your files.',
+				render: (setting: Setting) => {
+					setting.addButton(button => button
+						.setButtonText('Login with google')
+						.setCta()
+						.onClick(() => {
+							this.plugin.authenticateGoogle();
+						})
+					);
+				}
+			},
+			{
+				name: 'Mobile authentication / manual login',
+				desc: 'For mobile users: after clicking login above, your browser will eventually say "site can\'t be reached". Copy that entire url and paste it here.',
+				render: (setting: Setting) => {
+					setting
+						.addText(text => {
+							text
+								.setPlaceholder('Http://127.0.0.1:8420/callback?code=...')
+								.onChange((value) => {
+									manualAuthInput = value;
+								});
+						})
+						.addButton(button => button
+							.setButtonText('Verify')
+							.onClick(() => {
+								if (manualAuthInput) {
+									this.plugin.processManualAuth(manualAuthInput);
+								} else {
+									new Notice('Please paste the url first.');
+								}
+							})
+						);
+				}
+			},
+			{
+				name: 'Enable debug logging',
+				desc: 'Print verbose sync operation messages to developer console. Set to off to keep the console clean.',
+				render: (setting: Setting) => {
+					setting.addToggle(toggle => toggle
+						.setValue(this.plugin.settings.debugLogging)
+						.onChange(async (value) => {
+							this.plugin.settings.debugLogging = value;
+							await this.plugin.saveSettings();
+						})
+					);
+				}
+			},
+		];
 	}
 }
 
@@ -244,7 +272,7 @@ export class VaultSuggestModal extends SuggestModal<RemoteVaultOption> {
 
 	getSuggestions(query: string): RemoteVaultOption[] {
 		const matches = this.options.filter(v => v.name.toLowerCase().includes(query.toLowerCase()));
-		
+
 		if (query.trim().length > 0) {
 			matches.unshift({
 				name: `[+ Create new vault]: "${query}"`,
@@ -256,7 +284,7 @@ export class VaultSuggestModal extends SuggestModal<RemoteVaultOption> {
 	}
 
 	renderSuggestion(option: RemoteVaultOption, el: HTMLElement): void {
-		el.createEl("div", {text: option.name, cls: option.isCreateNew ? "omnidrive-create-new" : ""});
+		el.createDiv({text: option.name, cls: option.isCreateNew ? "omnidrive-create-new" : ""});
 	}
 
 	async onChooseSuggestion(option: RemoteVaultOption, evt: MouseEvent | KeyboardEvent) {
@@ -275,10 +303,6 @@ export class VaultSuggestModal extends SuggestModal<RemoteVaultOption> {
 
 			await this.plugin.rebuildIndex();
 
-			try {
-				(this.plugin.app as any).setting.openTabById(this.plugin.manifest.id);
-			} catch (e) {
-				// Fail silently
-			}
+			this.plugin.settingTab?.update();
 		}
 }
