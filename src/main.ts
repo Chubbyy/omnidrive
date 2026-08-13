@@ -1453,6 +1453,16 @@ async syncAttachment(file: TFile) {
 						} else {
 							this.log(`OmniDrive: Drive-side rename ignored (${this.settings.syncStrategy} mode): ${knownPath}`);
 						}
+					} else if (healedMissingExtension && this.settings.syncStrategy === 'two-way') {
+						const abstractFile = this.app.vault.getAbstractFileByPath(fullLocalPath);
+						if (abstractFile) {
+							try {
+								this.log(`OmniDrive: Pushing missing extension back to Drive for ${fullLocalPath}...`);
+								await this.moveOrRenameInDrive(driveID, abstractFile, fullLocalPath, token);
+							} catch (e) {
+								console.warn(`OmniDrive: Failed to push the corrected extension back to Drive for ${fullLocalPath}.`, e);
+							}
+						}
 					}
 
 					if (this.settings.syncStrategy === 'two-way') {
