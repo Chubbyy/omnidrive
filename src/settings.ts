@@ -238,7 +238,7 @@ export class OmniDriveSettingTab extends PluginSettingTab {
 			},
 			{
 				name: 'Enable debug logging',
-				desc: 'Print verbose sync operation messages to developer console. Set to off to keep the console clean.',
+				desc: 'Print verbose sync operation messages to the developer console and a local log file. Disable when not troubleshooting.',
 				render: (setting: Setting) => {
 					setting.addToggle(toggle => toggle
 						.setValue(this.plugin.settings.debugLogging)
@@ -273,10 +273,11 @@ export class VaultSuggestModal extends SuggestModal<RemoteVaultOption> {
 	getSuggestions(query: string): RemoteVaultOption[] {
 		const matches = this.options.filter(v => v.name.toLowerCase().includes(query.toLowerCase()));
 
-		if (query.trim().length > 0) {
+		const trimmedQuery = query.trim();
+		if (trimmedQuery.length > 0) {
 			matches.unshift({
-				name: `[+ Create new vault]: "${query}"`,
-				id: query,
+				name: `[+ Create new vault]: "${trimmedQuery}"`,
+				id: trimmedQuery,
 				isCreateNew: true,
 			});
 		}

@@ -49,18 +49,20 @@ To use OmniDrive, you have to generate your own Google Cloud credentials. This i
 
 3. Click **Login with Google**.
 4. Your browser will open. Select the same Google account that you made the Google Cloud key with. Grant OmniDrive permission to access your Google Drive. If you are greeted with a message saying something along the lines of "Google hasn't verified this app", you can press "Continue" or "Advanced" and then "Go to OmniDrive (unsafe)" or "Continue" to bypass.
-5. Once authenticated, you may close the browser tab. OmniDrive will automatically create a root `OmniDrive` folder in your Google Drive and begin syncing. 
+5. Once authenticated, you may close the browser tab. OmniDrive will create a root OmniDrive folder in your Google Drive if one does not already exist. Synchronization begins after you enable syncing.
 
 **Mobile users:** you will likely see an error when attempting to redirect back to the app. To circumvent this issue, copy the address (127.0.0.1...) and paste it in the "Mobile authentication / manual login" setting field, then hit "Verify."
 
 ## Usage & Commands
-OmniDrive runs automatically in the background based on your Auto-Sync Interval setting (unless you set that to 0), but you may also control it manually using the Command Palette (`Ctrl/Cmd + P`):
+Once Enable syncing is turned on, OmniDrive runs automatically in the background based on your Auto-Sync Interval setting (unless you set it to 0), but you may also control it manually using the Command Palette `(Ctrl/Cmd + P)`:
 
 * **OmniDrive: Sync active file:** Performs a sync of the currently open file with Google Drive.
-* **OmniDrive: Rebuild index:** Rebuilds OmniDrive's local tracking index from the current vault and Google Drive state.
-* **OmniDrive: Test Google Drive connection:** Pings the Google Drive API your access token is valid and returns the connected Google Account email.
+* **OmniDrive: Rebuild index:** Rebuilds OmniDrive's local tracking index and re-establishes synchronization links with the configured Google Drive vault.
+* **OmniDrive: Test Google Drive connection:** Pings the Google Drive API to verify that your access token is valid and returns the connected Google Account email.
 * **OmniDrive: Setup Google Drive folder:** A diagnostic command that forces the plugin to verify or generate the master OmniDrive folder structure in your Drive.
 * **OmniDrive: Calculate hash of current file:** A developer diagnostic tool that calculates and displays the current SHA-256 state hash of the active file.
+* **OmniDrive: Show debug log:** Opens a window inside Obsidian showing the debug log contents. Useful on mobile which has no native developer console to refer to.
+* **OmniDrive: Clear debug log:** Empties the debug log file.
 
 You can additionally perform a manual sync of your entire vault using the cloud icon found in the left ribbon.
 
@@ -94,6 +96,8 @@ When the Remote Vault location is changed, the files in the previous location ar
 **Sync seems stuck or is throwing errors in the console?** Press `Ctrl/Cmd + P` (swipe down near the top of the screen on mobile) and run the "OmniDrive: Rebuild index" command. It will attempt to reset the plugin's memory without deleting anything.
 
 **Errors/Issues after moving or deleting the remote folder in Google Drive?** You may restore the folder back in its original location or press `Ctrl/Cmd + P` (swipe down near the top of the screen on mobile) and run the "OmniDrive: Rebuild index" command. You may also attempt to resync if you haven't done so. Both attempt to recreate the remote folder.
+
+**Need more detail than the on-screen notices give you?** Turn on Enable debug logging in OmniDrive settings, reproduce the issue, then run OmniDrive: Show debug log to view a detailed activity log directly inside Obsidian (compatible with mobile, too). Run OmniDrive: Clear debug log to empty it as needed. Debug logs can include file/folder names and Google Drive IDs, so review the contents before sharing them (e.g., in a bug report).
 
 ## Known Quirks
 *These are documented "issues" that are deemed as closer to edge cases rather than substantial, system-breaking problems. Some may be due to a system limitation, how Google Drive's API works, or other reasons not easily circumventable. The ones listed below may or may not be resolved completely in future patches.*

@@ -390,7 +390,7 @@ export default class OmniDrive extends Plugin {
 			id: 'show-debug-log',
 			name: 'Show debug log',
 			callback: async () => {
-				const path = `${this.app.vault.configDir}/plugins/${this.manifest.id}/omnidrive-debug.log`;
+				const path = `${this.manifest.dir}/omnidrive-debug.log`;
 				let content = '(no log yet: enable debug logging, reproduce the issue, then run this again)';
 				try {
 					if (await this.app.vault.adapter.exists(path)) content = await this.app.vault.adapter.read(path);
@@ -405,7 +405,7 @@ export default class OmniDrive extends Plugin {
 			id: 'clear-debug-log',
 			name: 'Clear debug log',
 			callback: async () => {
-				const path = `${this.app.vault.configDir}/plugins/${this.manifest.id}/omnidrive-debug.log`;
+				const path = `${this.manifest.dir}/omnidrive-debug.log`;
 				try {
 					if (await this.app.vault.adapter.exists(path)) {
 						await this.app.vault.adapter.write(path, '');
@@ -448,19 +448,24 @@ export default class OmniDrive extends Plugin {
 		this.processQueue();
 	}
 
-	async logToFile(message: string) {
+	private logWriteChain: Promise<void> = Promise.resolve();
+
+	async logToFile(message: string): Promise<void> {
 		if (!this.settings.debugLogging) return;
-		try {
-			const path = `${this.app.vault.configDir}/plugins/${this.manifest.id}/omnidrive-debug.log`;
-			const line = `[${new Date().toISOString()}] ${message}\n`;
-			if (await this.app.vault.adapter.exists(path)) {
-				await this.app.vault.adapter.append(path, line);
-			} else {
-				await this.app.vault.adapter.write(path, line);
+		this.logWriteChain = this.logWriteChain.then(async () => {
+			try {
+				const path = `${this.manifest.dir}/omnidrive-debug.log`;
+				const line = `[${new Date().toISOString()}] ${message}\n`;
+				if (await this.app.vault.adapter.exists(path)) {
+					await this.app.vault.adapter.append(path, line);
+				} else {
+					await this.app.vault.adapter.write(path, line);
+				}
+			} catch {
+				// Best-effort only; logging must never break sync itself
 			}
-		} catch {
-			// Best-effort only; logging must never break sync itself0
-		}
+		});
+		return this.logWriteChain;
 	}
 
 	async processQueue(): Promise<void> {
@@ -1219,10 +1224,10 @@ async syncAttachment(file: TFile) {
 					const search = await requestUrl({ url: url, method: 'GET', headers: {'Authorization': `Bearer ${token}`}, throw: false });
 
 					if (search.status < 200 || search.status >= 300) {
-						const errorBody = search.json ?? search.text;
-						console.error(`OmniDrive: Folder listing failed for ${current.id} ` + `(status ${search.status}):`, errorBody);
-						await this.logToFile(`Folder listing failed for ${current.id} (status ${search.status}): ` + `${JSON.stringify(errorBody)}`);
-						this.logToFile(`Listing folder ${current.id}, path="${current.path}", `+ `pageToken=${pageToken ? 'present' : 'none'}`);
+						let errorBody: unknown;
+						try { errorBody = search.json; } catch { errorBody = search.text; }
+						console.error(`OmniDrive: Folder listing failed for ${current.id} (status ${search.status}):`, errorBody);
+						await this.logToFile(`Folder listing failed for ${current.id} (status ${search.status}), path="${current.path}": ${JSON.stringify(errorBody)}`);
 						return false;
 					}
 
@@ -1404,7 +1409,7 @@ async syncAttachment(file: TFile) {
 					if (knownPath && knownPath !== fullLocalPath && !this.isPathIgnored(fullLocalPath)) {
 						if (this.settings.syncStrategy === 'two-way') {
 							if (wasMarkdown !== isMarkdown) {
-								console.warn(`OmniDrive: Drive rename of "${knownPath}" to "${fullLocalPath}" would change its type (Markdown ↔ attachment). Skipping automatic mirror to avoid corrupting the file — rename it back to a matching extension in Drive, or rename the local file directly, to resolve.`);
+								console.warn(`OmniDrive: Drive rename of "${knownPath}" to "${fullLocalPath}" would change its type (Markdown ↔ attachment). Skipping automatic mirror to avoid corrupting the file; rename it back to a matching extension in Drive, or rename the local file directly to resolve.`);
 								continue;
 							}
 							this.log(`OmniDrive: Remote file rename detected. Renaming locally from ${knownPath} to ${fullLocalPath}...`);
@@ -1724,7 +1729,7 @@ async syncAttachment(file: TFile) {
 		if (!token) return null;
 
 		const masterFolderName = "OmniDrive";
-		const vaultFolderName = this.settings.remoteVaultName || "Main Vault";
+		const vaultFolderName = (this.settings.remoteVaultName || "Main Vault").trim();
 		let masterFolderID = "";
 
 		try {
@@ -1844,54 +1849,6 @@ async syncAttachment(file: TFile) {
 			}
 		}
 		return currentParentID;
-	}
-
-	async getLocalPathFromDrive(parentID: string, rootFolderID: string, token: string): Promise<string> {
-		let currentID = parentID;
-		const pathParts: {name: string, id: string}[] = [];
-		let depth = 0;
-
-		while (currentID && currentID !== rootFolderID && depth < 20) {
-			try {
-				const response = await requestUrl({
-					url: `https://www.googleapis.com/drive/v3/files/${currentID}?fields=id,name,parents`,
-					method: 'GET',
-					headers: {'Authorization': `Bearer ${token}`},
-				});
-
-				const folderData = response.json;
-				pathParts.unshift({name: folderData.name, id: currentID});
-
-				if (folderData.parents && folderData.parents.length > 0) {
-					currentID = folderData.parents[0];
-				} else {
-					break;
-				}
-			} catch (error) {
-				console.error(`OmniDrive: Error crawling Drive path for ${currentID}`, error);
-			}
-			depth++;
-		}
-		if (pathParts.length === 0) return "";
-
-		let currentLocalPath = "";
-
-		for (const part of pathParts) {
-			currentLocalPath += (currentLocalPath === "" ? "" : "/") + part.name;
-
-			this.settings.folderMap[currentLocalPath] = part.id;
-
-			const abstractFile = this.app.vault.getAbstractFileByPath(currentLocalPath);
-			if (!abstractFile) {
-				try {
-					await this.app.vault.createFolder(currentLocalPath);
-					this.log(`OmniDrive: Built missing local directory (${currentLocalPath})`);
-				} catch {
-					continue;
-				}
-			}
-		}
-		return currentLocalPath + "/";
 	}
 
 	async testDriveConnection() {
