@@ -32,6 +32,7 @@ export default class OmniDrive extends Plugin {
 
 	syncQueue: (() => Promise<void>)[] = [];
 	isProcessingQueue: boolean = false;
+	queueFailureCount: number = 0;
 	driveFolderResolutionPromise: Promise<string | null> | null = null;
 
 	cachedAccessToken: string | null = null;
@@ -487,7 +488,9 @@ export default class OmniDrive extends Plugin {
 						// Avoiding Google API 429 rate limiting
 						await new Promise(resolve => window.setTimeout(resolve, 100));
 					} catch (error: any) {
+						this.queueFailureCount++;
 						console.error("OmniDrive: Queue task failed:", error);
+						if (!this.isSyncing) new Notice('OmniDrive: a queued operation failed. Check console for details.', 8000);
 						// Surface Drive quota errors to the user
 						if (error.message?.includes('403') || error.status === 403 || error.toString().includes('Quota')) {
 							new Notice('OmniDrive error: Google Drive storage full or permission denied. Check console for details.', 10000);
@@ -508,6 +511,7 @@ export default class OmniDrive extends Plugin {
 		}
 		this.isSyncing = true;
 
+		const failuresBefore = this.queueFailureCount;
 		new Notice('OmniDrive: rebuilding index and pushing local files...');
 
 		this.settings.syncState = {};
@@ -538,7 +542,7 @@ export default class OmniDrive extends Plugin {
 				});
 			}
 			await this.processQueue();
-			new Notice('OmniDrive: rebuild complete. Architecture restored.');
+			this.reportSyncCompletion(failuresBefore, false, 'OmniDrive: rebuild complete. Architecture restored.');
 		} catch (error) {
 			console.error(error);
 		} finally {
@@ -723,12 +727,30 @@ export default class OmniDrive extends Plugin {
 		}
 	}
 
+	/** Retry only local reads; never replay writes or network operations. */
+	async readFileWithRetry<T>(file: TFile, read: () => Promise<T>): Promise<T> {
+		for (let attempt = 0; ; attempt++) {
+			try {
+				return await read();
+			} catch (error) {
+				const code = (error as { code?: string } | null)?.code;
+				const transient = ['UNKNOWN', 'EBUSY', 'EAGAIN', 'EIO', 'ETIMEDOUT'].includes(code ?? '')
+					|| /\b(UNKNOWN|EBUSY|EAGAIN|EIO|ETIMEDOUT)\b/.test(String(error));
+				if (!transient || attempt >= 2) throw error;
+				this.log(`OmniDrive: Read failed for ${file.path}; retrying (${attempt + 1}/2).`);
+				await new Promise(resolve => window.setTimeout(resolve, 400 * (attempt + 1)));
+			}
+		}
+	}
+
 	async syncFile(file: TFile) {
 		// Checking local DB first (fast)
 		let omnidriveID = this.settings.mdFileMap[file.path];
 
 		// Parse YAML only if we don't know the file (slow)
 		if (!omnidriveID) {
+			// Hydrate cloud-backed files before attempting a frontmatter write.
+			await this.readFileWithRetry(file, () => this.app.vault.read(file));
 			await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
 				if (frontmatter['omnidrive_id']) {
 					omnidriveID = frontmatter['omnidrive_id'];
@@ -775,13 +797,13 @@ export default class OmniDrive extends Plugin {
 		}
 
 		const folderID = this.settings.driveFolderID || await this.getCreateDriveFolder();
-		if (!folderID) return;
+		if (!folderID) throw new Error('Could not resolve Google Drive folder.');
 
 		const token = await this.getAccessToken();
-		if (!token) return;
+		if (!token) throw new Error('Could not obtain Google Drive access token.');
 
 		try {
-			const localContent = await this.app.vault.read(file);
+			const localContent = await this.readFileWithRetry(file, () => this.app.vault.read(file));
 			const localHash = await this.calculateHash(localContent);
 			const lastSyncHash = this.settings.syncState[omnidriveID as string];
 
@@ -866,8 +888,7 @@ export default class OmniDrive extends Plugin {
 				await this.syncFile(file); // Self-Heal: Re-run as a new file!
 				return;
 			} else if (cloudResponse.status >= 400) {
-				console.error(`OmniDrive: Transient error (status ${cloudResponse.status}) fetching ${file.name} from Drive. Skipping this cycle; will retry on next sync.`);
-				return;
+				throw new Error(`Drive read failed for ${file.path} (status ${cloudResponse.status}).`);
 			}
 
 			const cloudContent = cloudResponse.text;
@@ -875,6 +896,16 @@ export default class OmniDrive extends Plugin {
 
 			if (localHash === cloudHash) {
 				// Same current state between local and cloud
+				this.settings.syncState[omnidriveID as string] = localHash;
+				await this.saveSettings();
+			} else if (this.settings.syncStrategy !== 'two-way') {
+				// Backup/archive content is authoritative locally, including conflicts.
+				await requestUrl({
+					url: `https://www.googleapis.com/upload/drive/v3/files/${driveFileID}?uploadType=media`,
+					method: 'PATCH',
+					headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'text/plain' },
+					body: localContent,
+				});
 				this.settings.syncState[omnidriveID as string] = localHash;
 				await this.saveSettings();
 			} else if (localHash === lastSyncHash && cloudHash !== lastSyncHash) {
@@ -887,7 +918,7 @@ export default class OmniDrive extends Plugin {
 					await this.app.fileManager.processFrontMatter(file, (fm) => {
 						fm['omnidrive_id'] = omnidriveID;
 					});
-					const healedContent = await this.app.vault.read(file);
+					const healedContent = await this.readFileWithRetry(file, () => this.app.vault.read(file));
 					await requestUrl({
 						url: `https://www.googleapis.com/upload/drive/v3/files/${driveFileID}?uploadType=media`,
 						method: 'PATCH',
@@ -938,6 +969,7 @@ export default class OmniDrive extends Plugin {
 		} catch (error: any) {
 			console.error(`Sync Error on ${file.name}:`, error);
 			await this.logToFile(`Sync Error on ${file.name}: ${error?.message ?? error}${error?.stack ? '\n' + error.stack : ''}`);
+			throw error;
 		}
 	}
 
@@ -1006,10 +1038,10 @@ export default class OmniDrive extends Plugin {
 
 async syncAttachment(file: TFile) {
 		const folderID = this.settings.driveFolderID || await this.getCreateDriveFolder();
-		if (!folderID) return;
+		if (!folderID) throw new Error('Could not resolve Google Drive folder.');
 
 		const token = await this.getAccessToken();
-		if (!token) return;
+		if (!token) throw new Error('Could not obtain Google Drive access token.');
 
 		try {
 			const currentLocalMTime = file.stat.mtime.toString();
@@ -1038,7 +1070,7 @@ async syncAttachment(file: TFile) {
 					const dl = await requestUrl({ url: `https://www.googleapis.com/drive/v3/files/${sizeMatchedExisting.id}?alt=media`, headers: {'Authorization': `Bearer ${token}`}, throw: false });
 
 					if (dl.status === 200) {
-						const localBuffer = await this.app.vault.readBinary(file);
+						const localBuffer = await this.readFileWithRetry(file, () => this.app.vault.readBinary(file));
 						const [cloudHash, localHash] = await Promise.all([
 							this.calculateBufferHash(dl.arrayBuffer),
 							this.calculateBufferHash(localBuffer)
@@ -1060,7 +1092,7 @@ async syncAttachment(file: TFile) {
 					if (existing && existing.length > 0) {
 						this.log(`OmniDrive: Found a same-named file in Drive, but its content didn't match. Uploading as new.`);
 					}
-					const binaryContent = await this.app.vault.readBinary(file);
+					const binaryContent = await this.readFileWithRetry(file, () => this.app.vault.readBinary(file));
 
 					if (binaryContent.byteLength > 5 * 1024 * 1024) {
 						this.log(`OmniDrive: Initiating massive file upload (${file.name})...`);
@@ -1109,14 +1141,13 @@ async syncAttachment(file: TFile) {
 						await this.syncAttachment(file);
 						return;
 					} else if (metaRes.status >= 400) {
-						console.error(`OmniDrive: Transient error (status ${metaRes.status}) fetching metadata for ${file.name} from Drive. Skipping this cycle; will retry on next sync.`);
-						return;
+						throw new Error(`Drive metadata read failed for ${file.path} (status ${metaRes.status}).`);
 					}
 					
 					const currentCloudMTime = new Date(metaRes.json.modifiedTime).getTime().toString();
 
 				// Migrate legacy (pre-3-way) state
-				if (lastCloudMTime === "") {
+				if (lastCloudMTime === "" && this.settings.syncStrategy === 'two-way') {
 					this.settings.syncState[file.path] = `${currentLocalMTime}|${currentCloudMTime}`;
 					await this.saveSettings();
 					this.log(`OmniDrive: Migrated ${file.name} to 3-way attachment tracking.`);
@@ -1128,7 +1159,7 @@ async syncAttachment(file: TFile) {
 
 				if (!localChanged && !cloudChanged) {
 					return; // In sync
-				} else if (!localChanged && cloudChanged) {
+				} else if (this.settings.syncStrategy === 'two-way' && !localChanged && cloudChanged) {
 					this.log(`OmniDrive: Cloud attachment changed. Downloading ${file.name}...`);
 					const dl = await requestUrl({
 						url: `https://www.googleapis.com/drive/v3/files/${driveFileID}?alt=media`,
@@ -1141,8 +1172,8 @@ async syncAttachment(file: TFile) {
 						this.settings.syncState[file.path] = `${updatedFile.stat.mtime.toString()}|${currentCloudMTime}`;
 						await this.saveSettings();
 					}
-				} else if (localChanged && !cloudChanged) {
-					const binaryContent = await this.app.vault.readBinary(file);
+				} else if (this.settings.syncStrategy !== 'two-way' || (localChanged && !cloudChanged)) {
+					const binaryContent = await this.readFileWithRetry(file, () => this.app.vault.readBinary(file));
 					if (binaryContent.byteLength > 5 * 1024 * 1024) {
 						this.log(`OmniDrive: Initiating large file update (${file.name})...`);
 						await this.resumableUpload(token, file.name, binaryContent, driveFileID, null);
@@ -1175,7 +1206,7 @@ async syncAttachment(file: TFile) {
 					});
 					await this.app.vault.createBinary(conflictFilePath, dl.arrayBuffer);
 
-					const binaryContent = await this.app.vault.readBinary(file);
+					const binaryContent = await this.readFileWithRetry(file, () => this.app.vault.readBinary(file));
 					if (binaryContent.byteLength > 5 * 1024 * 1024) {
 						await this.resumableUpload(token, file.name, binaryContent, driveFileID, null);
 					} else {
@@ -1198,6 +1229,7 @@ async syncAttachment(file: TFile) {
 			}
 		} catch (error) {
 			console.error(`Attachment Sync Error on ${file.name}:`, error);
+			throw error;
 		}
 	}
 
@@ -1453,7 +1485,9 @@ async syncAttachment(file: TFile) {
 						} else {
 							this.log(`OmniDrive: Drive-side rename ignored (${this.settings.syncStrategy} mode): ${knownPath}`);
 						}
-					} else if (healedMissingExtension && this.settings.syncStrategy === 'two-way') {
+					} else if (healedMissingExtension && knownPath === fullLocalPath
+						&& !this.isPathIgnored(fullLocalPath) && this.settings.syncStrategy === 'two-way') {
+						// Only repair the name when this is the same tracked, non-ignored local file.
 						const abstractFile = this.app.vault.getAbstractFileByPath(fullLocalPath);
 						if (abstractFile) {
 							try {
@@ -1538,6 +1572,7 @@ async syncAttachment(file: TFile) {
 						}
 					}
 				} catch (itemError) {
+					this.queueFailureCount++;
 					console.error(`OmniDrive: Failed processing cloud item ${cloudItem.data.name}:`, itemError);
 					await this.logToFile(`Failed processing cloud item ${cloudItem.data.name}: ${String(itemError)}`);
 					continue;
@@ -1548,6 +1583,15 @@ async syncAttachment(file: TFile) {
 			console.error("Cloud Pull Error:", error);
 			await this.logToFile(`Cloud Pull Error: ${(error as any)?.message ?? error}${(error as any)?.stack ? '\n' + (error as any).stack : ''}`);
 			return false;
+		}
+	}
+
+	private reportSyncCompletion(failuresBefore: number, silent: boolean, successMessage: string) {
+		const failures = this.queueFailureCount - failuresBefore;
+		if (failures > 0) {
+			new Notice(`OmniDrive: sync incomplete; ${failures} operation(s) failed. Check console for details and run sync again.`, 8000);
+		} else if (!silent) {
+			new Notice(successMessage);
 		}
 	}
 
@@ -1564,6 +1608,7 @@ async syncAttachment(file: TFile) {
 
 		this.isSyncing = true;
 
+		const failuresBefore = this.queueFailureCount;
 		try {
 			if (!silent) new Notice('OmniDrive: starting background sync...');
 
@@ -1596,7 +1641,7 @@ async syncAttachment(file: TFile) {
 
 			// Run the radar scan and let it FULLY finish before snapshotting local files; otherwise, anything it just pulled from Drive won't get pushed back/reconciled
 			// until the next sync cycle.
-			let pullSucceeded = true;
+			let pullSucceeded = false;
 			this.enqueueTask(async () => {
 				pullSucceeded = await this.pullCloudChanges();
 			});
@@ -1622,10 +1667,11 @@ async syncAttachment(file: TFile) {
 			}
 			await this.processQueue();
 
-			if (!silent) new Notice('OmniDrive: vault syncing successfully completed.');
+			this.reportSyncCompletion(failuresBefore, silent, 'OmniDrive: vault syncing successfully completed.');
 
 		} catch (error) {
 			console.error("OmniDrive: Sync error", error);
+			new Notice('OmniDrive: sync failed. Check console for details.', 8000);
 		} finally {
 			this.isSyncing = false;
 			this.lastSyncTime = Date.now();
