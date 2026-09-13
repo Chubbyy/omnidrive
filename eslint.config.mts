@@ -3,7 +3,7 @@ import tseslint from "typescript-eslint";
 
 export default tseslint.config(
 	{
-		ignores: ["main.js", "version-bump.mjs", "eslint.config.mts", "esbuild.config.mjs"]
+		ignores: ["tests/**", "main.js", "version-bump.mjs", "eslint.config.mts", "esbuild.config.mjs"]
 	},
 	...tseslint.configs.recommended,
 	...obsidianmd.configs.recommended,
