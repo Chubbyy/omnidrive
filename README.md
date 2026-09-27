@@ -127,6 +127,3 @@ OmniDrive contains no ads and requires no payment.
 
 ## License
 This project is licensed under the MIT license. See `LICENSE` for details.
-## Development checks
-
-Run `npm ci`, then `npm test`, `npm run build`, and `npm run lint`. Regression tests use mocked Obsidian, Google Drive, and SecretStorage interfaces; they do not modify a real vault or account. Live desktop/mobile upgrade and sync smoke tests remain necessary before release.
