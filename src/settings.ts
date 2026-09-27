@@ -4,6 +4,7 @@ import OmniDrive from "./main";
 export interface OmniDriveSettings {
 	hideIDProperty: boolean;
 	clientID: string;
+	credentialStorageID: string;
 	clientSecret: string;
 	refreshToken: string;
 	driveFolderID: string;
@@ -25,6 +26,7 @@ export interface OmniDriveSettings {
 export const DEFAULT_SETTINGS: OmniDriveSettings = {
 	hideIDProperty: true,
 	clientID: '',
+	credentialStorageID: '',
 	clientSecret: '',
 	refreshToken: '',
 	driveFolderID: '',
@@ -193,8 +195,11 @@ export class OmniDriveSettingTab extends PluginSettingTab {
 							.setPlaceholder('Enter client secret...')
 							.setValue(this.plugin.settings.clientSecret)
 							.onChange(async (value) => {
-								this.plugin.settings.clientSecret = value;
-								await this.plugin.saveSettings();
+								try {
+									await this.plugin.saveCredentials({ clientSecret: value });
+								} catch {
+									new Notice('OmniDrive: could not save the client secret. Try again when credential storage is available.', 8000);
+								}
 							})
 					});
 				}
@@ -288,7 +293,14 @@ export class VaultSuggestModal extends SuggestModal<RemoteVaultOption> {
 		el.createDiv({text: option.name, cls: option.isCreateNew ? "omnidrive-create-new" : ""});
 	}
 
-	async onChooseSuggestion(option: RemoteVaultOption, evt: MouseEvent | KeyboardEvent) {
+	onChooseSuggestion(option: RemoteVaultOption, evt: MouseEvent | KeyboardEvent): void {
+		void this.chooseVault(option).catch(error => {
+			console.error('OmniDrive: remote vault selection failed:', error);
+			new Notice('OmniDrive: could not select the remote vault. Check console for details.', 8000);
+		});
+	}
+
+	private async chooseVault(option: RemoteVaultOption): Promise<void> {
 			if (option.isCreateNew) {
 				new Notice(`Creating new remote vault: ${option.id}...`);
 				this.plugin.settings.remoteVaultName = option.id;

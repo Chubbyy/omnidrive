@@ -1,4 +1,8 @@
-import {Notice, Plugin, requestUrl, TFile, TFolder, Platform, TAbstractFile, Modal, App} from 'obsidian';
+import { loadCredentials, storeCredentials, sanitizeSettings, credentialFields, type CredentialChanges } from './credentials';
+import { findFolder, listFolders, folderProperties } from './drive-folders';
+import { reversePaths, cascadePaths } from './sync-index';
+import { driveRequest as requestUrl } from './drive-api';
+import {Notice, Plugin, TFile, TFolder, Platform, TAbstractFile, Modal, App} from 'obsidian';
 import {DEFAULT_SETTINGS, OmniDriveSettings, OmniDriveSettingTab} from "./settings";
 interface OmniDriveOAuthServer {
 	close(): void;
@@ -33,6 +37,7 @@ export default class OmniDrive extends Plugin {
 	syncQueue: (() => Promise<void>)[] = [];
 	isProcessingQueue: boolean = false;
 	queueFailureCount: number = 0;
+	private selfInitiatedRenames = new Map<TAbstractFile, { oldPath: string; newPath: string }>();
 	driveFolderResolutionPromise: Promise<string | null> | null = null;
 
 	cachedAccessToken: string | null = null;
@@ -105,6 +110,12 @@ export default class OmniDrive extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on('rename', async (file, oldPath) => {
+				const mirroredRename = this.selfInitiatedRenames.get(file);
+				if (mirroredRename?.oldPath === oldPath && mirroredRename.newPath === file.path) {
+					// Cloud pull owns the map updates for this exact event. Consume it once.
+					this.selfInitiatedRenames.delete(file);
+					return;
+				}
 				if (!this.settings.enableSync) return;
 				this.enqueueTask(async () => {
 					if (this.isPathIgnored(file.path)) {
@@ -247,15 +258,9 @@ export default class OmniDrive extends Plugin {
 
 							if (parentID) {
 								try {
-									const safeName = file.name.replace(/'/g, "\\'");
-									const query = encodeURIComponent(`'${parentID}' in parents and name='${safeName}' and mimeType='application/vnd.google-apps.folder' and trashed=false`);
-									const search = await requestUrl({
-										url: `https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id)`,
-										method: 'GET',
-										headers: {'Authorization': `Bearer ${token}`}
-									});
-									if (search.json.files?.length > 0) driveFolderID = search.json.files[0].id;
-								} catch (e) { console.error("Fallback folder lookup failed:", e); }
+									const folder = await findFolder(file.name, parentID, 'folder', token);
+									if (folder) driveFolderID = folder.id;
+								} catch (e) { console.error("Fallback folder lookup failed:", e); throw e; }
 							}
 						}
 
@@ -364,7 +369,9 @@ export default class OmniDrive extends Plugin {
 			id: 'setup-drive-folder',
 			name: 'Setup Google Drive folder',
 			callback: () => {
-				this.getCreateDriveFolder();
+				void this.getCreateDriveFolder().catch(error => {
+					console.error('OmniDrive: folder setup failed:', error);
+				});
 			}
 		});
 
@@ -514,19 +521,21 @@ export default class OmniDrive extends Plugin {
 		const failuresBefore = this.queueFailureCount;
 		new Notice('OmniDrive: rebuilding index and pushing local files...');
 
-		this.settings.syncState = {};
-		this.settings.mdFileMap = {};
-		this.settings.attachmentMap = {};
-		this.settings.mdDriveMap = {};
-		this.settings.folderMap = {};
-		this.settings.tombstones = [];
 
 		try {
 			const token = await this.getAccessToken();
-			if (token) {
-				this.settings.driveFolderID = "";
-				await this.getCreateDriveFolder();
-			}
+			if (!token) throw new Error('Cannot rebuild without authentication.');
+			const folderState = await this.verifyRemoteFolder(token);
+			if (folderState === 'error') throw new Error('Cannot verify the selected remote vault.');
+			if (folderState === 'missing') this.settings.driveFolderID = '';
+			if (!this.settings.driveFolderID && !await this.getCreateDriveFolder()) throw new Error('Cannot resolve the remote vault.');
+
+			this.settings.syncState = {};
+			this.settings.mdFileMap = {};
+			this.settings.attachmentMap = {};
+			this.settings.mdDriveMap = {};
+			this.settings.folderMap = {};
+			this.settings.tombstones = [];
 
 			await this.saveSettings();
 
@@ -545,6 +554,8 @@ export default class OmniDrive extends Plugin {
 			this.reportSyncCompletion(failuresBefore, false, 'OmniDrive: rebuild complete. Architecture restored.');
 		} catch (error) {
 			console.error(error);
+			this.log('OmniDrive: rebuild failed; check console for details.');
+			new Notice('OmniDrive: rebuild failed. Check console for details.', 8000);
 		} finally {
 			this.isSyncing = false;
 		}
@@ -715,8 +726,7 @@ export default class OmniDrive extends Plugin {
 
 			const data = response.json;
 
-			this.settings.refreshToken = data.refresh_token;
-			await this.saveSettings();
+			await this.saveCredentials({ refreshToken: data.refresh_token });
 
 			new Notice('OmniDrive successfully connected to Google Drive.');
 
@@ -1247,11 +1257,12 @@ async syncAttachment(file: TFile) {
 				const current = foldersToSearch.shift();
 				if (!current) continue;
 				let pageToken: string | undefined = undefined;
+				const seenPageTokens = new Set<string>();
 
 				do {
 					const query = encodeURIComponent(`'${current.id}' in parents and trashed=false`);
-					let url = `https://www.googleapis.com/drive/v3/files?q=${query}&fields=nextPageToken,files(id,name,mimeType,appProperties,parents,modifiedTime)`;
-					if (pageToken) url += `&pageToken=${pageToken}`;
+					let url = `https://www.googleapis.com/drive/v3/files?q=${query}&pageSize=1000&fields=nextPageToken,files(id,name,mimeType,appProperties,parents,modifiedTime)`;
+					if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
 
 					const search = await requestUrl({ url: url, method: 'GET', headers: {'Authorization': `Bearer ${token}`}, throw: false });
 
@@ -1265,6 +1276,8 @@ async syncAttachment(file: TFile) {
 
 					const filesInFolder = search.json.files || [];
 					pageToken = search.json.nextPageToken;
+					if (pageToken && seenPageTokens.has(pageToken)) throw new Error(`Repeated Drive page token for ${current.path || '/'}.`);
+					if (pageToken) seenPageTokens.add(pageToken);
 
 					for (const file of filesInFolder) {
 						if (file.mimeType === 'application/vnd.google-apps.folder') {
@@ -1281,7 +1294,13 @@ async syncAttachment(file: TFile) {
 										const parentDir = folderLocalPath.includes('/') ? folderLocalPath.substring(0, folderLocalPath.lastIndexOf('/')) : "";
 										if (parentDir) await this.ensureLocalDirectoryExists(parentDir);
 										try {
-											await this.app.fileManager.renameFile(abstractFolder, folderLocalPath);
+											this.selfInitiatedRenames.set(abstractFolder, { oldPath: knownFolderPath, newPath: folderLocalPath });
+											try {
+												await this.app.fileManager.renameFile(abstractFolder, folderLocalPath);
+											} finally {
+												this.selfInitiatedRenames.delete(abstractFolder);
+											}
+											cascadePaths([this.settings.folderMap, this.settings.mdDriveMap, this.settings.mdFileMap, this.settings.attachmentMap, this.settings.syncState], knownFolderPath, folderLocalPath);
 											delete this.settings.folderMap[knownFolderPath];
 											this.settings.folderMap[folderLocalPath] = file.id;
 										} catch(e) {
@@ -1314,7 +1333,7 @@ async syncAttachment(file: TFile) {
 			await this.saveSettings();
 			this.log(`OmniDrive RADAR: Crawl complete. Found ${cloudFiles.length} files.`);
 
-			const foundCloudIDs = cloudFiles.map(c => c.data.id);
+			const foundCloudIDs = new Set(cloudFiles.map(c => c.data.id));
 
 			if (this.settings.syncStrategy === 'two-way') {
 				const isOrphanedByLostFolder = (path: string) => lostFolderPaths.some(folderPath => path.startsWith(folderPath + '/'));
@@ -1322,7 +1341,7 @@ async syncAttachment(file: TFile) {
 				const sweepReverseGraveyard = async (map: Record<string, string>, isMarkdown: boolean) => {
 					const pathsToKill: string[] = [];
 					for (const [localPath, driveID] of Object.entries(map)) {
-						if (!foundCloudIDs.includes(driveID) && !this.settings.tombstones.includes(driveID)) {
+						if (!foundCloudIDs.has(driveID) && !this.settings.tombstones.includes(driveID)) {
 							if (isOrphanedByLostFolder(localPath)) {
 								this.log(`OmniDrive: ${localPath}'s parent folder vanished from Drive; unlinking (not deleting) so the next pass can re-verify.`);
 								if (isMarkdown) delete this.settings.mdDriveMap[localPath];
@@ -1364,7 +1383,7 @@ async syncAttachment(file: TFile) {
 				// Local is the source of truth, so if a tracked file vanished from Drive (deleted or trashed), clear its mapping so it gets pushed again in this sync.
 				const reuploadStale = (map: Record<string, string>) => {
 					const stale = Object.entries(map).filter(([, driveID]) =>
-						!foundCloudIDs.includes(driveID) && !this.settings.tombstones.includes(driveID)
+						!foundCloudIDs.has(driveID) && !this.settings.tombstones.includes(driveID)
 					);
 					if (stale.length > 0 && Object.keys(map).length > 0 && stale.length >= Math.max(3, Object.keys(map).length * 0.8)) {
 						this.log("OmniDrive: Large portion of tracked files missing from Drive — likely a crawl issue, not real deletions. Skipping mass re-push this cycle.");
@@ -1379,6 +1398,8 @@ async syncAttachment(file: TFile) {
 				reuploadStale(this.settings.attachmentMap);
 			}
 
+			const markdownPaths = reversePaths(this.settings.mdDriveMap);
+			const attachmentPaths = reversePaths(this.settings.attachmentMap);
 			for (const cloudItem of cloudFiles) {
 				try {
 					const cloudFile = cloudItem.data;
@@ -1391,8 +1412,8 @@ async syncAttachment(file: TFile) {
 					let effectiveCloudName = cloudFile.name;
 					let healedMissingExtension = false;
 					if (!cloudFile.name.includes('.')) {
-						const previousPath = Object.keys(this.settings.mdDriveMap).find(p => this.settings.mdDriveMap[p] === driveID)
-							|| Object.keys(this.settings.attachmentMap).find(p => this.settings.attachmentMap[p] === driveID);
+						const previousPath = markdownPaths.get(driveID)
+							|| attachmentPaths.get(driveID);
 						if (previousPath) {
 							const previousName = previousPath.substring(previousPath.lastIndexOf('/') + 1);
 							const dotIndex = previousName.lastIndexOf('.');
@@ -1425,15 +1446,15 @@ async syncAttachment(file: TFile) {
 					let wasMarkdown = isMarkdown;
 
 					if (isMarkdown) {
-						knownPath = Object.keys(this.settings.mdDriveMap).find(p => this.settings.mdDriveMap[p] === driveID);
+						knownPath = markdownPaths.get(driveID);
 						if (!knownPath) {
-							knownPath = Object.keys(this.settings.attachmentMap).find(p => this.settings.attachmentMap[p] === driveID);
+							knownPath = attachmentPaths.get(driveID);
 							wasMarkdown = false;
 						}
 					} else {
-						knownPath = Object.keys(this.settings.attachmentMap).find(p => this.settings.attachmentMap[p] === driveID);
+						knownPath = attachmentPaths.get(driveID);
 						if (!knownPath) {
-							knownPath = Object.keys(this.settings.mdDriveMap).find(p => this.settings.mdDriveMap[p] === driveID);
+							knownPath = markdownPaths.get(driveID);
 							wasMarkdown = true;
 						}
 					}
@@ -1449,7 +1470,13 @@ async syncAttachment(file: TFile) {
 							if (abstractFile) {
 								if (cloudItem.parentPath) await this.ensureLocalDirectoryExists(cloudItem.parentPath);
 								try {
-									await this.app.fileManager.renameFile(abstractFile, fullLocalPath);
+									// Cloud pull owns this rename and its tracking updates.
+									this.selfInitiatedRenames.set(abstractFile, { oldPath: knownPath, newPath: fullLocalPath });
+									try {
+										await this.app.fileManager.renameFile(abstractFile, fullLocalPath);
+									} finally {
+										this.selfInitiatedRenames.delete(abstractFile);
+									}
 
 									if (wasMarkdown) {
 										delete this.settings.mdDriveMap[knownPath];
@@ -1460,9 +1487,11 @@ async syncAttachment(file: TFile) {
 
 									if (isMarkdown) {
 										this.settings.mdDriveMap[fullLocalPath] = driveID;
+									markdownPaths.set(driveID, fullLocalPath);
 										if (vsID) this.settings.mdFileMap[fullLocalPath] = vsID;
 									} else {
 										this.settings.attachmentMap[fullLocalPath] = driveID;
+									attachmentPaths.set(driveID, fullLocalPath);
 									}
 
 									if (this.settings.syncState[knownPath]) {
@@ -1501,7 +1530,7 @@ async syncAttachment(file: TFile) {
 
 					if (this.settings.syncStrategy === 'two-way') {
 						if (isMarkdown) {
-							const alreadyTracked = Object.values(this.settings.mdDriveMap).includes(driveID);
+							const alreadyTracked = markdownPaths.has(driveID);
 							const alreadyLocal = this.app.vault.getAbstractFileByPath(fullLocalPath) !== null;
 
 							if (!alreadyTracked && !alreadyLocal) {
@@ -1516,6 +1545,7 @@ async syncAttachment(file: TFile) {
 										// Drive object already carries our ID (e.g., a retried patch); rare occurrence. Link immediately
 										this.settings.mdFileMap[fullLocalPath] = vsID;
 										this.settings.mdDriveMap[fullLocalPath] = driveID;
+									markdownPaths.set(driveID, fullLocalPath);
 										this.settings.syncState[vsID] = await this.calculateHash(dl.text);
 										await this.saveSettings();
 									} else {
@@ -1534,6 +1564,7 @@ async syncAttachment(file: TFile) {
 
 										this.settings.mdFileMap[fullLocalPath] = newID;
 										this.settings.mdDriveMap[fullLocalPath] = driveID;
+									markdownPaths.set(driveID, fullLocalPath);
 
 										if (metaPatch.status >= 200 && metaPatch.status < 300 && contentPatch.status >= 200 && contentPatch.status < 300) {
 											this.settings.syncState[newID] = await this.calculateHash(updatedContent);
@@ -1545,7 +1576,7 @@ async syncAttachment(file: TFile) {
 								}
 							}
 						} else if (!isMarkdown) {
-							const alreadyTrackedAttachment = Object.values(this.settings.attachmentMap).includes(driveID);
+							const alreadyTrackedAttachment = attachmentPaths.has(driveID);
 							const alreadyLocalAttachment = this.app.vault.getAbstractFileByPath(fullLocalPath) !== null;
 							
 							if (!alreadyTrackedAttachment) {
@@ -1561,6 +1592,7 @@ async syncAttachment(file: TFile) {
 											const newFile = await this.app.vault.createBinary(fullLocalPath, dl.arrayBuffer);
 											const currentCloudMTime = cloudFile.modifiedTime ? new Date(cloudFile.modifiedTime).getTime().toString() : "";
 											this.settings.attachmentMap[fullLocalPath] = driveID;
+									attachmentPaths.set(driveID, fullLocalPath);
 											this.settings.syncState[fullLocalPath] = `${newFile.stat.mtime.toString()}|${currentCloudMTime}`;
 											await this.saveSettings();
 										}
@@ -1588,6 +1620,7 @@ async syncAttachment(file: TFile) {
 
 	private reportSyncCompletion(failuresBefore: number, silent: boolean, successMessage: string) {
 		const failures = this.queueFailureCount - failuresBefore;
+		this.log(failures > 0 ? `OmniDrive: sync completed with ${failures} failed operation(s).` : successMessage);
 		if (failures > 0) {
 			new Notice(`OmniDrive: sync incomplete; ${failures} operation(s) failed. Check console for details and run sync again.`, 8000);
 		} else if (!silent) {
@@ -1610,6 +1643,7 @@ async syncAttachment(file: TFile) {
 
 		const failuresBefore = this.queueFailureCount;
 		try {
+			this.log('OmniDrive: sync started.');
 			if (!silent) new Notice('OmniDrive: starting background sync...');
 
 			const token = await this.getAccessToken();
@@ -1671,6 +1705,7 @@ async syncAttachment(file: TFile) {
 
 		} catch (error) {
 			console.error("OmniDrive: Sync error", error);
+			this.log("OmniDrive: sync failed; check console for details.");
 			new Notice('OmniDrive: sync failed. Check console for details.', 8000);
 		} finally {
 			this.isSyncing = false;
@@ -1678,12 +1713,58 @@ async syncAttachment(file: TFile) {
 		}
 	}
 
+	private settingsWriteChain: Promise<void> = Promise.resolve();
+	// A failed legacy migration must never be followed by a sanitized state write.
+	private legacyMigrationPending = false;
+
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<OmniDriveSettings>);
+		const saved = await this.loadData() as Partial<OmniDriveSettings> | null;
+		this.settings = Object.assign(JSON.parse(JSON.stringify(DEFAULT_SETTINGS)) as OmniDriveSettings, saved);
+		this.legacyMigrationPending = !!(saved?.clientSecret || saved?.refreshToken);
+		try {
+			loadCredentials(this.settings, this.app.secretStorage);
+			if (this.legacyMigrationPending) {
+				await this.persistCredentials({ clientSecret: this.settings.clientSecret, refreshToken: this.settings.refreshToken }, true);
+				this.legacyMigrationPending = false;
+			}
+		} catch {
+			new Notice('OmniDrive: could not access credential storage. Existing settings were preserved. Restart the app and try again.', 10000);
+			throw new Error('OmniDrive credential storage unavailable.');
+		}
 	}
 
-	async saveSettings() {
-		await this.saveData(this.settings);
+	private queueSettingsWrite(write: () => Promise<void>): Promise<void> {
+		const save = this.settingsWriteChain.catch(() => {}).then(write);
+		this.settingsWriteChain = save;
+		return save;
+	}
+
+	async saveSettings(): Promise<void> {
+		if (this.legacyMigrationPending) throw new Error('OmniDrive credential migration must finish before saving settings.');
+		const snapshot = JSON.parse(JSON.stringify(sanitizeSettings(this.settings))) as ReturnType<typeof sanitizeSettings>;
+		await this.queueSettingsWrite(() => this.saveData(snapshot));
+	}
+
+	async saveCredentials(changes: CredentialChanges): Promise<void> {
+		if (this.legacyMigrationPending) throw new Error('OmniDrive credential migration must finish before changing credentials.');
+		await this.persistCredentials(changes);
+	}
+
+	private async persistCredentials(changes: CredentialChanges, migration = false): Promise<void> {
+		const requestedFields = credentialFields.filter(field => Object.prototype.hasOwnProperty.call(changes, field));
+		for (const field of requestedFields) {
+			if (typeof changes[field] !== 'string') throw new Error('Invalid credential value.');
+		}
+		if (!this.settings.credentialStorageID) this.settings.credentialStorageID = `omnidrive-${window.crypto.randomUUID()}`;
+		const snapshot = JSON.parse(JSON.stringify({ ...this.settings, ...changes })) as OmniDriveSettings;
+		await this.queueSettingsWrite(async () => {
+			const changedFields = requestedFields.filter(field => migration || this.settings[field] !== snapshot[field]);
+			if (changedFields.length) storeCredentials(snapshot, this.app.secretStorage, changedFields);
+			// Publish in-memory credentials only after secure storage verification.
+			for (const field of requestedFields) this.settings[field] = snapshot[field];
+			if (changedFields.length) { this.cachedAccessToken = null; this.tokenExpiration = 0; }
+			await this.saveData(sanitizeSettings(snapshot));
+		});
 	}
 
 	async getAccessToken(): Promise<string | null> {
@@ -1708,8 +1789,7 @@ async syncAttachment(file: TFile) {
 				if (response.status !== 200) {
 					if (response.json?.error === 'invalid_grant') {
 						this.log("OmniDrive: Refresh token invalid or expired. Clearing token.");
-						this.settings.refreshToken = '';
-						await this.saveSettings();
+						await this.saveCredentials({ refreshToken: '' });
 						new Notice('OmniDrive: your google login has expired or was revoked. Reconnect via settings → OmniDrive → login with google.', 10000);
 					} else {
 						console.error("Token Refresh Error: ", response.json || response);
@@ -1732,40 +1812,13 @@ async syncAttachment(file: TFile) {
 	async scanForRemoteVaults(): Promise<{name: string, id: string, isCreateNew: boolean}[] | null> {
 		const token = await this.getAccessToken();
 		if (!token) return null;
-
-		const masterFolderName = "OmniDrive";
-
 		try {
-			const masterQuery = encodeURIComponent(`mimeType='application/vnd.google-apps.folder' and name='${masterFolderName}' and trashed=false`);
-			
-			const masterSearch = await requestUrl({
-				url: `https://www.googleapis.com/drive/v3/files?q=${masterQuery}&fields=files(id)`,
-				method: 'GET',
-				headers: {
-					'Authorization': `Bearer ${token}`
-				},
-			});
-
-			if (!masterSearch.json.files || masterSearch.json.files.length == 0) {
-				return [];
-			}
-
-			const masterFolderID = masterSearch.json.files[0].id;
-			const vaultQuery = encodeURIComponent(`'${masterFolderID}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`);
-			
-			const vaultSearch = await requestUrl({
-				url: `https://www.googleapis.com/drive/v3/files?q=${vaultQuery}&fields=files(id,name)`,
-				method: 'GET',
-				headers: {
-					'Authorization': `Bearer ${token}`,
-				},
-			});
-
-			const vaults = vaultSearch.json.files || [];
-			return vaults.map((v: any) => ({name: v.name, id: v.id, isCreateNew: false}));
+			const master = await findFolder('OmniDrive', null, 'root', token);
+			if (!master) return [];
+			const vaults = await listFolders(`'${master.id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`, token);
+			return vaults.map(v => ({ name: v.name, id: v.id, isCreateNew: false }));
 		} catch (error) {
-			console.error("Vault Scan Error:", error);
-			new Notice("Failed to scan drive for vaults.");
+			new Notice(String(error), 10000);
 			return null;
 		}
 	}
@@ -1773,138 +1826,51 @@ async syncAttachment(file: TFile) {
 	async getCreateDriveFolder(): Promise<string | null> {
 		if (this.driveFolderResolutionPromise) return this.driveFolderResolutionPromise;
 		this.driveFolderResolutionPromise = this._getCreateDriveFolder();
-		try {
-			return await this.driveFolderResolutionPromise;
-		} finally {
-			this.driveFolderResolutionPromise = null;
-		}
+		try { return await this.driveFolderResolutionPromise; }
+		finally { this.driveFolderResolutionPromise = null; }
+	}
+
+	private async resolveFolder(name: string, parent: string | null, role: string, token: string): Promise<string> {
+		const match = await findFolder(name, parent, role, token);
+		if (match) return match.id;
+		const created = await requestUrl({
+			url: 'https://www.googleapis.com/drive/v3/files', method: 'POST',
+			headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name, mimeType: 'application/vnd.google-apps.folder', ...(parent ? { parents: [parent] } : {}), appProperties: folderProperties(role) }),
+		});
+		const data: unknown = created.json;
+		if (!data || typeof data !== 'object' || !('id' in data) || typeof data.id !== 'string') throw new Error('Invalid Drive folder creation response.');
+		return data.id;
 	}
 
 	private async _getCreateDriveFolder(): Promise<string | null> {
 		const token = await this.getAccessToken();
 		if (!token) return null;
-
-		const masterFolderName = "OmniDrive";
-		const vaultFolderName = (this.settings.remoteVaultName || "Main Vault").trim();
-		let masterFolderID = "";
-
 		try {
-			const masterQuery = encodeURIComponent(`mimeType='application/vnd.google-apps.folder' and name='${masterFolderName}' and trashed=false`);
-			const masterSearch = await requestUrl({
-				url: `https://www.googleapis.com/drive/v3/files?q=${masterQuery}&fields=files(id)`,
-				method: 'GET',
-				headers: {'Authorization': `Bearer ${token}`}
-			});
-
-			if (masterSearch.json.files && masterSearch.json.files.length > 0) {
-				masterFolderID = masterSearch.json.files[0].id;
-			} else {
-				this.log('OmniDrive: Creating main OmniDrive directory...');
-				const masterCreate = await requestUrl({
-					url: 'https://www.googleapis.com/drive/v3/files',
-					method: 'POST',
-					headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-					body: JSON.stringify({ name: masterFolderName, mimeType: 'application/vnd.google-apps.folder' })
-				});
-				masterFolderID = masterCreate.json.id;
-			}
-
-			const safeVaultName = vaultFolderName.replace(/'/g, "\\'");
-			const vaultQuery = encodeURIComponent(`'${masterFolderID}' in parents and mimeType='application/vnd.google-apps.folder' and name='${safeVaultName}' and trashed=false`);			const vaultSearch = await requestUrl({
-				url: `https://www.googleapis.com/drive/v3/files?q=${vaultQuery}&fields=files(id)`,
-				method: 'GET',
-				headers: {'Authorization': `Bearer ${token}`}
-			});
-
-			let vaultFolderID = "";
-			if (vaultSearch.json.files && vaultSearch.json.files.length > 0) {
-				vaultFolderID = vaultSearch.json.files[0].id;
-			} else {
-				this.log(`OmniDrive: Creating sub-folder for vault: ${vaultFolderName}...`);
-				const vaultCreate = await requestUrl({
-					url: 'https://www.googleapis.com/drive/v3/files',
-					method: 'POST',
-					headers: { 
-						'Authorization': `Bearer ${token}`, 
-						'Content-Type': 'application/json' 
-					},
-					body: JSON.stringify({ 
-						name: vaultFolderName, 
-						parents: [masterFolderID], 
-						mimeType: 'application/vnd.google-apps.folder' 
-					})
-				});
-				vaultFolderID = vaultCreate.json.id;
-			}
-
-			this.settings.driveFolderID = vaultFolderID;
+			const master = await this.resolveFolder('OmniDrive', null, 'root', token);
+			const vault = await this.resolveFolder((this.settings.remoteVaultName || 'Main Vault').trim(), master, 'vault', token);
+			this.settings.driveFolderID = vault;
 			await this.saveSettings();
-
-			return vaultFolderID;
-
+			return vault;
 		} catch (error) {
-			console.error('Folder Creation Error:', error);
-			new Notice('Failed to locate or create Google Drive folders. Check console.');
-			return null;
+			this.log(`OmniDrive: folder resolution failed: ${String(error)}`);
+			new Notice(String(error), 10000);
+			throw error;
 		}
 	}
 
 	async getTargetFolderID(filePath: string, rootFolderID: string, token: string): Promise<string> {
-		const parts = filePath.split('/');
-		if (parts.length === 1) return rootFolderID;
-
-		const folderNames = parts.slice(0, -1);
-		let currentParentID = rootFolderID;
-		let currentLocalPath = "";
-
-		for (const folderName of folderNames) {
-			currentLocalPath += (currentLocalPath === "" ? "" : "/") + folderName;
-			if (this.settings.folderMap[currentLocalPath]) {
-				currentParentID = this.settings.folderMap[currentLocalPath] as string;
-				continue;
-			}
-			const safeFolderName = folderName.replace(/'/g, "\\'");
-			const query = encodeURIComponent(`'${currentParentID}' in parents and name='${safeFolderName}' and mimeType='application/vnd.google-apps.folder' and trashed=false`);			
-			try {
-				const searchResponse = await requestUrl({
-					url: `https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id)`,
-					method: 'GET',
-					headers: {'Authorization': `Bearer ${token}`},
-				});
-
-				const files = searchResponse.json.files;
-
-				if (files && files.length > 0) {
-					currentParentID = files[0].id;
-					this.settings.folderMap[currentLocalPath] = currentParentID;
-					await this.saveSettings();
-				} else {
-					this.log(`OmniDrive: Creating missing Drive folder (${folderName})`);
-					const createResponse = await requestUrl({
-						url: 'https://www.googleapis.com/drive/v3/files',
-						method: 'POST',
-						headers: {
-							'Authorization': `Bearer ${token}`,
-							'Content-Type': 'application/json',
-						},
-						body: JSON.stringify({
-							name: folderName,
-							parents: [currentParentID],
-							mimeType: 'application/vnd.google-apps.folder',
-						}),
-					});
-
-					currentParentID = createResponse.json.id;
-					this.settings.folderMap[currentLocalPath] = currentParentID;
-					await this.saveSettings();
-
-					}
-				} catch (error) {
-					console.error(`Error Mapping Folder ${folderName}:`, error);
-					return rootFolderID;
-			}
+		let parent = rootFolderID;
+		let path = '';
+		for (const name of filePath.split('/').slice(0, -1)) {
+			path += (path ? '/' : '') + name;
+			const cached = this.settings.folderMap[path];
+			if (cached) { parent = cached; continue; }
+			parent = await this.resolveFolder(name, parent, 'folder', token);
+			this.settings.folderMap[path] = parent;
+			await this.saveSettings();
 		}
-		return currentParentID;
+		return parent;
 	}
 
 	async testDriveConnection() {
