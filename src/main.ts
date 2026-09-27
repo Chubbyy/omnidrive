@@ -996,19 +996,35 @@ export default class OmniDrive extends Plugin {
 			metadata.parents = [parentFolderID];
 		}
 
-		const initResponse = await requestUrl({
-			url: url,
-			method: method,
-			headers: {
-				'Authorization': `Bearer ${token}`,
-				'Content-Type': 'application/json',
-				'X-Upload-Content-Length': binaryContent.byteLength.toString(),
-			},
-			body: JSON.stringify(metadata)
-		});
-
-		const uploadUrl = initResponse.headers['location'] || initResponse.headers['Location'];
-		if (!uploadUrl) throw new Error("Failed to get resumable upload URL");
+		// Transport errors can include request URLs. Never expose session credentials in diagnostics.
+		const diagnosticError = (error: unknown): string => {
+			const message = error && typeof error === 'object' && 'message' in error ? String(error.message) : String(error);
+			return message.replace(/https?:\/\/[^\s"'<>]+/gi, '[redacted URL]')
+				.replace(/upload_id=[^\s&"'<>]+/gi, 'upload_id=[redacted]');
+		};
+		let uploadUrl: string;
+		try {
+			const initResponse = await requestUrl({
+				url: url,
+				method: method,
+				throw: false,
+				headers: {
+					'Authorization': `Bearer ${token}`,
+					'Content-Type': 'application/json',
+					'X-Upload-Content-Type': 'application/octet-stream',
+					'X-Upload-Content-Length': binaryContent.byteLength.toString(),
+				},
+				body: JSON.stringify(metadata)
+			});
+			if (initResponse.status < 200 || initResponse.status >= 300) {
+				throw new Error(`HTTP status ${initResponse.status}`);
+			}
+			uploadUrl = Object.entries(initResponse.headers).find(([key]) => key.toLowerCase() === 'location')?.[1] ?? '';
+			this.log(`OmniDrive: Resumable upload initialization HTTP ${initResponse.status}; Location header received: ${uploadUrl ? 'yes' : 'no'}.`);
+			if (!uploadUrl) throw new Error('Missing resumable Location header');
+		} catch (error) {
+			throw new Error(`Resumable upload initialization failed: ${diagnosticError(error)}`);
+		}
 
 		// Breaking large file into 5MB chunks
 		const chunkSize = 5 * 1024 * 1024; 
@@ -1019,27 +1035,33 @@ export default class OmniDrive extends Plugin {
 			const end = Math.min(uploadedBytes + chunkSize, binaryContent.byteLength);
 			const chunk = binaryContent.slice(uploadedBytes, end);
 
-			const chunkResponse = await requestUrl({
-				url: uploadUrl,
-				method: 'PUT',
-				throw: false, 
-				headers: {
-					'Content-Length': chunk.byteLength.toString(),
-					'Content-Range': `bytes ${uploadedBytes}-${end - 1}/${binaryContent.byteLength}`
-				},
-				body: chunk
-			});
-
-			if (chunkResponse.status !== 308 && chunkResponse.status >= 400) {
-				if (chunkResponse.status === 403) throw new Error("403 Forbidden / Quota Exceeded");
-				throw new Error(`Chunk upload failed with status ${chunkResponse.status}`);
+			// Chunk indexes are one-based and the end byte is inclusive, matching Content-Range.
+			const chunkDetails = `chunk index=${Math.floor(uploadedBytes / chunkSize) + 1}, start byte=${uploadedBytes}, end byte=${end - 1}, chunk byte length=${chunk.byteLength}, total byte length=${binaryContent.byteLength}`;
+			this.log(`OmniDrive: Resumable upload PUT starting: ${chunkDetails}.`);
+			try {
+				const chunkResponse = await requestUrl({
+					url: uploadUrl,
+					method: 'PUT',
+					throw: false,
+					headers: {
+						'Content-Type': 'application/octet-stream',
+						'Content-Range': `bytes ${uploadedBytes}-${end - 1}/${binaryContent.byteLength}`
+					},
+					body: chunk
+				});
+				if (chunkResponse.status !== 308 && chunkResponse.status >= 400) {
+					if (chunkResponse.status === 403) throw new Error('HTTP 403 Forbidden / Quota Exceeded');
+					throw new Error(`HTTP status ${chunkResponse.status}`);
+				}
+				this.log(`OmniDrive: Resumable upload PUT HTTP ${chunkResponse.status}: ${chunkDetails}.`);
+				uploadedBytes = end;
+				if (uploadedBytes >= binaryContent.byteLength && chunkResponse.status < 300) {
+					if (!driveFileID) finalId = chunkResponse.json.id;
+				}
+			} catch (error) {
+				throw new Error(`Resumable upload chunk failed (${chunkDetails}): ${diagnosticError(error)}`);
 			}
 
-			uploadedBytes = end;
-
-			if (uploadedBytes >= binaryContent.byteLength && chunkResponse.status < 300) {
-				if (!driveFileID) finalId = chunkResponse.json.id;
-			}
 		}
 
 		if (!finalId) throw new Error("Upload completed but failed to retrieve File ID.");
